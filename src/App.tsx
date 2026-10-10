@@ -400,12 +400,11 @@ export default function App() {
       if (isCancelled) return;
       lastPriceRef.current = updatedCandle.close;
       setLastPrice(updatedCandle.close);
-      engine.checkActiveOpportunitiesLifecycle(
-        updatedCandle.close,
-        Date.now(),
-        updatedCandle.high,
-        updatedCandle.low
-      );
+      engine.checkActiveOpportunitiesLifecycle(updatedCandle.close, Date.now(), {
+        openTimeMs: updatedCandle.time * 1000,
+        high: updatedCandle.high,
+        low: updatedCandle.low,
+      });
       setCandles((prev) => {
         if (!prev.length) return [updatedCandle];
         const last = prev[prev.length - 1];

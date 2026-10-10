@@ -59,12 +59,18 @@ export interface OpportunityCard {
   targetPrice: number;
   riskPct: number;
   rrRatio: number;
+  netRrRatio?: number;
+  feePct?: number;
+  spreadBps?: number;
+  grossPnlPct?: number;
   confidence: 'HIGH' | 'MEDIUM' | 'LOW';
   confidenceScore: number;
   reasons: string[];
   timestamp: number;
   status: 'ACTIVE' | 'HIT_TARGET' | 'STOPPED' | 'EXPIRED';
   currentPrice?: number;
+  postEntryHigh?: number;
+  postEntryLow?: number;
   progressPct?: number;
   maxDurationSec?: number;
   exitPrice?: number;

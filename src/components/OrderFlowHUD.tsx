@@ -99,10 +99,13 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
   };
 
   const remainingSec = activeOpportunity
-    ? Math.max(0, (activeOpportunity.maxDurationSec || 180) - (activeOpportunity.durationSec || 0))
+    ? Math.max(0, (activeOpportunity.maxDurationSec || 240) - (activeOpportunity.durationSec || 0))
     : 0;
   const liveProgress = activeOpportunity?.progressPct ?? 0;
   const livePnl = activeOpportunity?.pnlPct ?? 0;
+  const liveGrossPnl = activeOpportunity?.grossPnlPct ?? 0;
+  const activeFeePct = activeOpportunity?.feePct ?? 0.10;
+  const activeHalfSpreadBps = +(((activeOpportunity?.spreadBps ?? 2.0) / 2).toFixed(1));
 
   return (
     <div className="absolute top-2.5 left-2.5 z-30 flex flex-col gap-2 max-w-[calc(100vw-90px)] pointer-events-auto">
@@ -237,11 +240,13 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
 
           <div className="grid grid-cols-4 gap-1.5 mb-2 text-center">
             <div className="bg-[#0d1117] p-1.5 rounded border border-[#21262d]">
-              <div className="text-[8px] text-[#8b949e]">GİRİŞ</div>
+              <div className="text-[8px] text-[#8b949e]">GİRİŞ (MID)</div>
               <div className="font-bold text-[#e6e8ea] text-[10px]">{activeOpportunity.entryPrice}</div>
             </div>
             <div className="bg-[#0d1117] p-1.5 rounded border border-[#4c8ce0]/40">
-              <div className="text-[8px] text-[#4c8ce0]">ANLIK</div>
+              <div className="text-[8px] text-[#4c8ce0]">
+                ÇIKIŞ ({activeOpportunity.bias === 'LONG' ? 'BID' : 'ASK'})
+              </div>
               <div className="font-bold text-[#e6e8ea] text-[10px]">
                 {activeOpportunity.currentPrice ?? activeOpportunity.entryPrice}
               </div>
@@ -265,8 +270,9 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                   livePnl >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
                 }`}
               >
-                {livePnl >= 0 ? '+' : ''}
-                {livePnl.toFixed(2)}% ({liveProgress >= 0 ? `Hedefe %${liveProgress}` : `Stopa %${Math.abs(liveProgress)}`})
+                Net: {livePnl >= 0 ? '+' : ''}
+                {livePnl.toFixed(2)}% (Brüt: {liveGrossPnl >= 0 ? '+' : ''}
+                {liveGrossPnl.toFixed(2)}%)
               </span>
               <span className="text-[#26a69a] font-bold">🎯 HEDEF</span>
             </div>
@@ -293,12 +299,18 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
             </div>
             <div className="flex items-center justify-between text-[9px] text-[#8b949e]">
               <span>Geçen: {activeOpportunity.durationSec || 0}s</span>
-              <span> R:R 1:{activeOpportunity.rrRatio} · Güven %{activeOpportunity.confidenceScore}</span>
+              <span>
+                Net R:R 1:{activeOpportunity.netRrRatio ?? activeOpportunity.rrRatio} · Güven %{activeOpportunity.confidenceScore}
+              </span>
               <span>
                 {activeOpportunity.status === 'ACTIVE'
                   ? `Kalan: ${remainingSec}s`
                   : `Çıkış: ${activeOpportunity.exitPrice}`}
               </span>
+            </div>
+            <div className="flex items-center justify-between text-[8px] text-[#8b949e]/80 pt-0.5 border-t border-[#21262d]/60">
+              <span>Maliyet: Komisyon %{activeFeePct.toFixed(2)} (10bps) + ½Spread {activeHalfSpreadBps}bps</span>
+              <span>{liveProgress >= 0 ? `Hedefe %${liveProgress}` : `Stopa %${Math.abs(liveProgress)}`}</span>
             </div>
           </div>
 
@@ -373,7 +385,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                   </div>
                 </div>
                 <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
-                  <div className="text-[9px] text-[#8b949e]">TOPLAM PnL</div>
+                  <div className="text-[9px] text-[#8b949e]">TOPLAM NET PnL</div>
                   <div
                     className={`font-bold text-sm ${
                       opportunityStats.totalPnL >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
@@ -396,7 +408,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                 allOpportunities.map((opp) => {
                   const pnl = opp.pnlPct ?? 0;
                   const prog = opp.progressPct ?? 0;
-                  const rem = Math.max(0, (opp.maxDurationSec || 180) - (opp.durationSec || 0));
+                  const rem = Math.max(0, (opp.maxDurationSec || 240) - (opp.durationSec || 0));
                   return (
                     <div
                       key={opp.id}
@@ -445,12 +457,12 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                           }`}
                         >
                           {opp.status === 'HIT_TARGET'
-                            ? `✅ Hedef (${pnl >= 0 ? '+' : ''}${pnl}%)`
+                            ? `✅ Net (${pnl >= 0 ? '+' : ''}${pnl}%)`
                             : opp.status === 'STOPPED'
-                            ? `🛑 Stop (${pnl}%)`
+                            ? `🛑 Net (${pnl}%)`
                             : opp.status === 'EXPIRED'
-                            ? `⏱️ Süre (${pnl >= 0 ? '+' : ''}${pnl}%)`
-                            : `🎯 Aktif (${pnl >= 0 ? '+' : ''}${pnl}% · ${rem}s)`}
+                            ? `⏱️ Net (${pnl >= 0 ? '+' : ''}${pnl}%)`
+                            : `🎯 Net (${pnl >= 0 ? '+' : ''}${pnl}% · ${rem}s)`}
                         </span>
                       </div>
 
@@ -459,7 +471,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                           Giriş: <strong className="text-[#e6e8ea]">{opp.entryPrice}</strong>
                         </div>
                         <div>
-                          {opp.status === 'ACTIVE' ? 'Anlık' : 'Çıkış'}:{' '}
+                          {opp.bias === 'LONG' ? 'Çıkış (Bid)' : 'Çıkış (Ask)'}:{' '}
                           <strong className="text-[#4c8ce0]">
                             {opp.exitPrice ?? opp.currentPrice ?? opp.entryPrice}
                           </strong>
@@ -491,7 +503,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
 
                       <div className="flex items-center justify-between text-[9px] text-[#8b949e] border-t border-[#21262d]/60 pt-1">
                         <span>
-                          R:R 1:{opp.rrRatio} · Güven: %{opp.confidenceScore} ({opp.confidence})
+                          Net R:R 1:{opp.netRrRatio ?? opp.rrRatio} (Brüt 1:{opp.rrRatio}) · Güven: %{opp.confidenceScore}
                         </span>
                         <span>
                           {opp.durationSec ? `${opp.durationSec}s` : '0s'} ·{' '}

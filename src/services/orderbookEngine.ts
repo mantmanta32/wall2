@@ -123,6 +123,12 @@ export class OrderbookEngine {
   public onOpportunityCreated?: (opp: OpportunityCard) => void;
   public onOpportunityUpdated?: (opp: OpportunityCard) => void;
 
+  // Standard Binance USDT-M Futures VIP0 Taker fee: 0.05% (5 bps) per leg -> 0.10% (10 bps) round-trip
+  private static readonly ROUND_TRIP_TAKER_FEE_PCT = 0.10; // 0.10% (10 bps)
+  private static readonly ROUND_TRIP_TAKER_FEE_BPS = 10;
+  // Minimum multiple of total execution cost (round-trip commission + half-spread) required for stop distance
+  private static readonly MIN_STOP_COST_MULTIPLE = 3.0;
+
   constructor(
     symbol: string,
     tickSize = 0.0001,
@@ -147,13 +153,13 @@ export class OrderbookEngine {
 
   private loadSavedOpportunities() {
     try {
-      const raw = localStorage.getItem('orderbook_opportunities_v1');
+      const raw = localStorage.getItem('orderbook_opportunities_v2');
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const now = Date.now();
         this.opportunities = parsed.slice(0, 60).map((card: OpportunityCard) => {
-          const maxDur = card.maxDurationSec || 180;
+          const maxDur = card.maxDurationSec || 240;
           const elapsedSec = Math.max(1, Math.round((now - card.timestamp) / 1000));
           if (card.status === 'ACTIVE' && (elapsedSec >= maxDur || card.symbol !== this.symbol)) {
             return {
@@ -162,7 +168,7 @@ export class OrderbookEngine {
               exitPrice: card.currentPrice || card.entryPrice,
               resolvedAt: card.timestamp + maxDur * 1000,
               durationSec: Math.min(elapsedSec, maxDur),
-              pnlPct: card.pnlPct ?? 0,
+              pnlPct: card.pnlPct ?? -(card.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT),
               progressPct: card.progressPct ?? 0,
             };
           }
@@ -176,7 +182,7 @@ export class OrderbookEngine {
 
   public saveOpportunities() {
     try {
-      localStorage.setItem('orderbook_opportunities_v1', JSON.stringify(this.opportunities.slice(0, 60)));
+      localStorage.setItem('orderbook_opportunities_v2', JSON.stringify(this.opportunities.slice(0, 60)));
     } catch {
       // Ignore storage errors
     }
@@ -1560,6 +1566,42 @@ export class OrderbookEngine {
     return { s5, s15, s30, s60, aligned, trend, strength };
   }
 
+  // Execution Cost & Bid/Ask Microstructure Helper:
+  // Computes real Binance USDT-M Futures VIP0 round-trip Taker commission (10 bps = 0.10%)
+  // plus real L2 half-spread cost (since entry is mid and LONG exits at Bid, SHORT exits at Ask).
+  private getExecutionCostProfile(refPrice?: number) {
+    const mid = this.midPrice || refPrice || 0;
+    const bookValid = this.depthReady && this.bestBid > 0 && this.bestAsk > this.bestBid;
+    const spreadPrice = bookValid
+      ? this.bestAsk - this.bestBid
+      : Math.max(this.tickSize, mid * 0.0002);
+    const halfSpreadPrice = spreadPrice / 2;
+    const spreadBps = mid > 0 ? +((spreadPrice / mid) * 10000).toFixed(2) : 2.0;
+    const halfSpreadBps = +(spreadBps / 2).toFixed(2);
+    const halfSpreadPct = +(halfSpreadBps / 100).toFixed(4);
+
+    const feeBps = OrderbookEngine.ROUND_TRIP_TAKER_FEE_BPS; // 10 bps
+    const feePct = OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT; // 0.10%
+    const totalCostBps = +(feeBps + halfSpreadBps).toFixed(2);
+    const totalCostPct = +(feePct + halfSpreadPct).toFixed(4);
+    const totalCostPrice = mid * (totalCostPct / 100);
+
+    return {
+      mid,
+      bookValid,
+      spreadPrice,
+      halfSpreadPrice,
+      spreadBps,
+      halfSpreadBps,
+      halfSpreadPct,
+      feeBps,
+      feePct,
+      totalCostBps,
+      totalCostPct,
+      totalCostPrice,
+    };
+  }
+
   // Generate opportunity card for Defended Walls (Dynamic Wall-Anchored Entry & Structural Target)
   private generateDefendedOpportunity(
     wall: WallRecord,
@@ -1583,18 +1625,29 @@ export class OrderbookEngine {
     const mid = this.midPrice;
     if (!mid) return;
 
-    // 1. Live Execution Entry Price: Strictly anchored to current live market price so card starts ACTIVE at 0% PnL
-    const entryPrice = +mid.toFixed(this.precision);
+    const costProfile = this.getExecutionCostProfile(mid);
+    // Reject scalp signal if orderbook spread is abnormally wide (> 25 bps)
+    if (costProfile.spreadBps > 25) return;
 
-    // 2. Stop Loss: Tight structural invalidation placed behind the defended wall, clamped to realistic scalp band (4.5 - 18 bps)
-    const wallStopBuffer = Math.max(this.tickSize * 2, wall.price * 0.0005);
+    // 1. Live Execution Entry Price
+    const entryPrice = +mid.toFixed(this.precision);
+    const initialExecExit = costProfile.bookValid
+      ? +(bias === 'LONG' ? this.bestBid : this.bestAsk).toFixed(this.precision)
+      : entryPrice;
+
+    // 2. Stop Loss: Placed behind the defended wall, strictly >= 3.0x total round-trip cost (commission + half-spread) and >= 28 bps
+    const wallStopBuffer = Math.max(this.tickSize * 3, wall.price * 0.0012);
     const rawStructuralStop = bias === 'LONG' ? wall.price - wallStopBuffer : wall.price + wallStopBuffer;
     const rawRiskDist =
       bias === 'LONG' ? Math.max(0, entryPrice - rawStructuralStop) : Math.max(0, rawStructuralStop - entryPrice);
 
-    const minRisk = Math.max(this.tickSize * 2, entryPrice * 0.00045); // 4.5 bps min scalp stop
-    const maxRisk = Math.max(this.tickSize * 6, entryPrice * 0.0018); // 18 bps max scalp stop
-    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || entryPrice * 0.0007));
+    const minRisk = Math.max(
+      this.tickSize * 4,
+      entryPrice * 0.0028, // 28 bps floor
+      costProfile.totalCostPrice * OrderbookEngine.MIN_STOP_COST_MULTIPLE // >= 3.0x total cost
+    );
+    const maxRisk = Math.max(minRisk * 1.8, entryPrice * 0.0065); // up to 65 bps max scalp stop
+    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || minRisk * 1.15));
 
     const stopPrice =
       bias === 'LONG'
@@ -1603,8 +1656,10 @@ export class OrderbookEngine {
 
     const actualRisk = Math.abs(entryPrice - stopPrice);
     if (actualRisk <= 0) return;
+    const actualRiskBps = (actualRisk / entryPrice) * 10000;
+    if (actualRiskBps < costProfile.totalCostBps * 2.5) return;
 
-    // 3. Structural Target Price: Identify opposing prominent liquidity wall within scalp range (1.4R - 2.8R)
+    // 3. Structural Target Price: Identify opposing prominent liquidity wall within fee-adjusted scalp range (1.8R - 3.2R)
     let structuralTarget: number | null = null;
     const oppSide = wall.side === 'B' ? 'A' : 'B';
     const opposingWalls = this.walls
@@ -1613,13 +1668,13 @@ export class OrderbookEngine {
 
     if (opposingWalls.length > 0) {
       const oppWall = opposingWalls[0];
-      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.00025);
+      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.0003);
       const candidateTarget =
         bias === 'LONG'
           ? +(oppWall.price - targetBuffer).toFixed(this.precision)
           : +(oppWall.price + targetBuffer).toFixed(this.precision);
       const dist = Math.abs(candidateTarget - entryPrice);
-      if (dist >= actualRisk * 1.4 && dist <= actualRisk * 2.8) {
+      if (dist >= actualRisk * 1.8 && dist <= actualRisk * 3.2) {
         structuralTarget = candidateTarget;
       }
     }
@@ -1645,7 +1700,7 @@ export class OrderbookEngine {
     if (structuralTarget) {
       targetPrice = structuralTarget;
     } else {
-      const dynamicMultiplier = Math.max(1.5, Math.min(2.6, 1.85 + flowBonus));
+      const dynamicMultiplier = Math.max(1.9, Math.min(2.8, 2.15 + flowBonus));
       targetPrice =
         bias === 'LONG'
           ? +(entryPrice + actualRisk * dynamicMultiplier).toFixed(this.precision)
@@ -1654,7 +1709,14 @@ export class OrderbookEngine {
 
     const reward = Math.abs(targetPrice - entryPrice);
     const rrRatio = +(reward / actualRisk).toFixed(2);
-    if (rrRatio < 1.35) return;
+    const grossRewardPct = (reward / entryPrice) * 100;
+    const grossRiskPct = (actualRisk / entryPrice) * 100;
+    const netRewardPct = +(grossRewardPct - costProfile.totalCostPct).toFixed(2);
+    const netRiskPct = +(grossRiskPct + costProfile.totalCostPct).toFixed(2);
+    const netRrRatio = netRiskPct > 0 ? +(netRewardPct / netRiskPct).toFixed(2) : 0;
+
+    // Require positive expectancy after deducting round-trip taker fee + half-spread
+    if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
     // 5. Scientific Multi-Variable Dynamic Confidence Calculation (0 - 100)
     const retentionScore = Math.round(Math.min(1.0, retentionPct / 100) * 16);
@@ -1681,13 +1743,13 @@ export class OrderbookEngine {
       else if (obi.aligned === 'BULL') flowScore -= 10;
     }
 
-    const rrScore = Math.min(15, Math.max(0, Math.round((rrRatio - 1.35) * 8)));
+    const rrScore = Math.min(15, Math.max(0, Math.round((netRrRatio - 1.0) * 12)));
     const rawScore = depthFactor + testFactor + flowScore + rrScore;
     const confidenceScore = Math.min(96, Math.max(42, Math.round(rawScore)));
     const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
       confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
 
-    const riskPct = +((actualRisk / entryPrice) * 100).toFixed(2);
+    const riskPct = +grossRiskPct.toFixed(2);
 
     const card: OpportunityCard = {
       id: `opp-def-${now}-${wall.price}`,
@@ -1702,21 +1764,27 @@ export class OrderbookEngine {
       targetPrice,
       riskPct,
       rrRatio,
+      netRrRatio,
+      feePct: costProfile.feePct,
+      spreadBps: costProfile.spreadBps,
+      grossPnlPct: 0,
       confidence,
       confidenceScore,
       reasons: [
-        `Anlık Giriş: ${entryPrice} (Duvar: ${wall.price}) · Stop: ${stopPrice} · Hedef: ${targetPrice}.`,
-        `Duvar Doluluk: %${retentionPct.toFixed(0)} korundu ($${this.formatCompact(currentNotional)} aktif tahtada).`,
-        `Emilim: Son 30s içinde ${recentTouchCount}× temas, $${this.formatCompact(recentTraded)} hacim karşılandı.`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Dinamik R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Anlık Giriş: ${entryPrice} (Duvar: ${wall.price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
+        `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
+        `Duvar Doluluk & Emilim: %${retentionPct.toFixed(0)} korundu ($${this.formatCompact(currentNotional)}), 30s'de ${recentTouchCount}× temas ($${this.formatCompact(recentTraded)} emildi).`,
+        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
-      currentPrice: entryPrice,
+      currentPrice: initialExecExit,
+      postEntryHigh: initialExecExit,
+      postEntryLow: initialExecExit,
       progressPct: 0,
-      pnlPct: 0,
+      pnlPct: -+costProfile.totalCostPct.toFixed(2),
       durationSec: 0,
-      maxDurationSec: 180,
+      maxDurationSec: 240,
     };
 
     this.opportunities.unshift(card);
@@ -1744,17 +1812,27 @@ export class OrderbookEngine {
     if (existing) return;
 
     const mid = this.midPrice || price;
-    const entryPrice = +mid.toFixed(this.precision);
+    const costProfile = this.getExecutionCostProfile(mid);
+    if (costProfile.spreadBps > 25) return;
 
-    // Stop Loss: Tightly anchored behind the swept wall, clamped to realistic scalp band (4.5 - 18 bps)
-    const rawStopBuffer = Math.max(this.tickSize * 2, price * 0.00055);
+    const entryPrice = +mid.toFixed(this.precision);
+    const initialExecExit = costProfile.bookValid
+      ? +(bias === 'LONG' ? this.bestBid : this.bestAsk).toFixed(this.precision)
+      : entryPrice;
+
+    // Stop Loss: Placed behind the swept wall, strictly >= 3.0x total round-trip cost (commission + half-spread) and >= 28 bps
+    const rawStopBuffer = Math.max(this.tickSize * 3, price * 0.0012);
     const rawStructuralStop = bias === 'SHORT' ? price + rawStopBuffer : price - rawStopBuffer;
     const rawRiskDist =
       bias === 'LONG' ? Math.max(0, entryPrice - rawStructuralStop) : Math.max(0, rawStructuralStop - entryPrice);
 
-    const minRisk = Math.max(this.tickSize * 2, entryPrice * 0.00045);
-    const maxRisk = Math.max(this.tickSize * 6, entryPrice * 0.0018);
-    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || entryPrice * 0.00075));
+    const minRisk = Math.max(
+      this.tickSize * 4,
+      entryPrice * 0.0028,
+      costProfile.totalCostPrice * OrderbookEngine.MIN_STOP_COST_MULTIPLE
+    );
+    const maxRisk = Math.max(minRisk * 1.8, entryPrice * 0.0065);
+    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || minRisk * 1.15));
 
     const stopPrice =
       bias === 'SHORT'
@@ -1763,8 +1841,10 @@ export class OrderbookEngine {
 
     const actualRisk = Math.abs(entryPrice - stopPrice);
     if (actualRisk <= 0) return;
+    const actualRiskBps = (actualRisk / entryPrice) * 10000;
+    if (actualRiskBps < costProfile.totalCostBps * 2.5) return;
 
-    // Structural Target: Next opposing wall in the orderbook within scalp range (1.4R - 2.8R)
+    // Structural Target: Next opposing wall in the orderbook within fee-adjusted scalp range (1.8R - 3.2R)
     let structuralTarget: number | null = null;
     const oppSide = side;
     const nextWalls = this.walls
@@ -1773,13 +1853,13 @@ export class OrderbookEngine {
 
     if (nextWalls.length > 0) {
       const targetWall = nextWalls[0];
-      const targetBuffer = Math.max(this.tickSize, targetWall.price * 0.00025);
+      const targetBuffer = Math.max(this.tickSize, targetWall.price * 0.0003);
       const candidateTarget =
         bias === 'SHORT'
           ? +(targetWall.price + targetBuffer).toFixed(this.precision)
           : +(targetWall.price - targetBuffer).toFixed(this.precision);
       const dist = Math.abs(candidateTarget - entryPrice);
-      if (dist >= actualRisk * 1.4 && dist <= actualRisk * 2.8) {
+      if (dist >= actualRisk * 1.8 && dist <= actualRisk * 3.2) {
         structuralTarget = candidateTarget;
       }
     }
@@ -1802,7 +1882,7 @@ export class OrderbookEngine {
     if (structuralTarget) {
       targetPrice = structuralTarget;
     } else {
-      const dynamicMultiplier = Math.max(1.55, Math.min(2.6, 1.9 + flowBonus));
+      const dynamicMultiplier = Math.max(1.9, Math.min(2.8, 2.2 + flowBonus));
       targetPrice =
         bias === 'SHORT'
           ? +(entryPrice - actualRisk * dynamicMultiplier).toFixed(this.precision)
@@ -1811,21 +1891,27 @@ export class OrderbookEngine {
 
     const reward = Math.abs(targetPrice - entryPrice);
     const rrRatio = +(reward / actualRisk).toFixed(2);
-    if (rrRatio < 1.35) return;
+    const grossRewardPct = (reward / entryPrice) * 100;
+    const grossRiskPct = (actualRisk / entryPrice) * 100;
+    const netRewardPct = +(grossRewardPct - costProfile.totalCostPct).toFixed(2);
+    const netRiskPct = +(grossRiskPct + costProfile.totalCostPct).toFixed(2);
+    const netRrRatio = netRiskPct > 0 ? +(netRewardPct / netRiskPct).toFixed(2) : 0;
+
+    if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
     const sweepVolumeRatio = Math.min(30, Math.round((executedNotional / Math.max(1, sweptNotional)) * 25));
     const sizeScore = Math.min(25, Math.round((sweptNotional / this.effectiveWhaleMinUsdt) * 15));
     let flowScore = 15;
     if (bias === 'SHORT' && cvd.direction === 'BEAR') flowScore += 15;
     else if (bias === 'LONG' && cvd.direction === 'BULL') flowScore += 15;
-    const rrScore = Math.min(15, Math.round((rrRatio - 1.35) * 8));
+    const rrScore = Math.min(15, Math.round((netRrRatio - 1.0) * 12));
 
     const rawScore = sweepVolumeRatio + sizeScore + flowScore + rrScore;
     const confidenceScore = Math.min(95, Math.max(45, rawScore));
     const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
       confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
 
-    const riskPct = +((actualRisk / entryPrice) * 100).toFixed(2);
+    const riskPct = +grossRiskPct.toFixed(2);
 
     const card: OpportunityCard = {
       id: `opp-sweep-${now}-${price}`,
@@ -1838,21 +1924,27 @@ export class OrderbookEngine {
       targetPrice,
       riskPct,
       rrRatio,
+      netRrRatio,
+      feePct: costProfile.feePct,
+      spreadBps: costProfile.spreadBps,
+      grossPnlPct: 0,
       confidence,
       confidenceScore,
       reasons: [
         `Likidite Süpürüldü: ${side === 'B' ? 'Destek' : 'Direnç'} duvarı ($${this.formatCompact(sweptNotional)}) piyasa emirleriyle temizlendi ($${this.formatCompact(executedNotional)} hacim emildi).`,
-        `Anlık Giriş: ${entryPrice} (Kırılan kademe: ${price}) · Stop: ${stopPrice} · Hedef: ${targetPrice}.`,
-        `Tahta Vakumu: Temizlenen kademelerin arkasındaki likidite boşluğuna doğru momentum genişlemesi hedeflendi.`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Anlık Giriş: ${entryPrice} (Kırılan: ${price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
+        `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
+        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
-      currentPrice: entryPrice,
+      currentPrice: initialExecExit,
+      postEntryHigh: initialExecExit,
+      postEntryLow: initialExecExit,
       progressPct: 0,
-      pnlPct: 0,
+      pnlPct: -+costProfile.totalCostPct.toFixed(2),
       durationSec: 0,
-      maxDurationSec: 180,
+      maxDurationSec: 240,
     };
 
     this.opportunities.unshift(card);
@@ -1884,17 +1976,27 @@ export class OrderbookEngine {
     if (existing) return;
 
     const mid = this.midPrice || price;
-    const entryPrice = +mid.toFixed(this.precision);
+    const costProfile = this.getExecutionCostProfile(mid);
+    if (costProfile.spreadBps > 25) return;
 
-    // 2. Stop Loss: Tight invalidation behind the confirmed iceberg level, clamped to scalp range (4.5 - 18 bps)
-    const rawStopBuffer = Math.max(this.tickSize * 2, price * 0.00055);
+    const entryPrice = +mid.toFixed(this.precision);
+    const initialExecExit = costProfile.bookValid
+      ? +(bias === 'LONG' ? this.bestBid : this.bestAsk).toFixed(this.precision)
+      : entryPrice;
+
+    // 2. Stop Loss: Invalidation behind the confirmed iceberg level, strictly >= 3.0x total cost and >= 28 bps
+    const rawStopBuffer = Math.max(this.tickSize * 3, price * 0.0012);
     const rawStructuralStop = bias === 'LONG' ? price - rawStopBuffer : price + rawStopBuffer;
     const rawRiskDist =
       bias === 'LONG' ? Math.max(0, entryPrice - rawStructuralStop) : Math.max(0, rawStructuralStop - entryPrice);
 
-    const minRisk = Math.max(this.tickSize * 2, entryPrice * 0.00045);
-    const maxRisk = Math.max(this.tickSize * 6, entryPrice * 0.0018);
-    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || entryPrice * 0.0007));
+    const minRisk = Math.max(
+      this.tickSize * 4,
+      entryPrice * 0.0028,
+      costProfile.totalCostPrice * OrderbookEngine.MIN_STOP_COST_MULTIPLE
+    );
+    const maxRisk = Math.max(minRisk * 1.8, entryPrice * 0.0065);
+    const risk = Math.min(maxRisk, Math.max(minRisk, rawRiskDist || minRisk * 1.15));
 
     const stopPrice =
       bias === 'LONG'
@@ -1903,8 +2005,10 @@ export class OrderbookEngine {
 
     const actualRisk = Math.abs(entryPrice - stopPrice);
     if (actualRisk <= 0) return;
+    const actualRiskBps = (actualRisk / entryPrice) * 10000;
+    if (actualRiskBps < costProfile.totalCostBps * 2.5) return;
 
-    // 3. Structural target based on opposing book liquidity within scalp range (1.4R - 2.8R)
+    // 3. Structural target based on opposing book liquidity within fee-adjusted scalp range (1.8R - 3.2R)
     const oppSide = side === 'B' ? 'A' : 'B';
     const opposingWalls = this.walls
       .filter((w) => w.side === oppSide && (bias === 'LONG' ? w.price > entryPrice : w.price < entryPrice))
@@ -1923,19 +2027,19 @@ export class OrderbookEngine {
     let usedStructural = false;
     if (opposingWalls.length > 0) {
       const oppWall = opposingWalls[0];
-      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.00025);
+      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.0003);
       const candidateTarget =
         bias === 'LONG'
           ? +(oppWall.price - targetBuffer).toFixed(this.precision)
           : +(oppWall.price + targetBuffer).toFixed(this.precision);
       const dist = Math.abs(candidateTarget - entryPrice);
-      if (dist >= actualRisk * 1.4 && dist <= actualRisk * 2.8) {
+      if (dist >= actualRisk * 1.8 && dist <= actualRisk * 3.2) {
         targetPrice = candidateTarget;
         usedStructural = true;
       }
     }
     if (!usedStructural) {
-      const dynamicMultiplier = Math.max(1.5, Math.min(2.6, 1.85 + flowAlignmentBonus));
+      const dynamicMultiplier = Math.max(1.9, Math.min(2.8, 2.15 + flowAlignmentBonus));
       targetPrice =
         bias === 'LONG'
           ? +(entryPrice + actualRisk * dynamicMultiplier).toFixed(this.precision)
@@ -1944,7 +2048,13 @@ export class OrderbookEngine {
 
     const reward = Math.abs(targetPrice - entryPrice);
     const rrRatio = +(reward / actualRisk).toFixed(2);
-    if (rrRatio < 1.35) return;
+    const grossRewardPct = (reward / entryPrice) * 100;
+    const grossRiskPct = (actualRisk / entryPrice) * 100;
+    const netRewardPct = +(grossRewardPct - costProfile.totalCostPct).toFixed(2);
+    const netRiskPct = +(grossRiskPct + costProfile.totalCostPct).toFixed(2);
+    const netRrRatio = netRiskPct > 0 ? +(netRewardPct / netRiskPct).toFixed(2) : 0;
+
+    if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
     const replenishRatio = tracker.replenishedNotional / Math.max(this.effectiveIcebergDisplayedFloor, tracker.peakNotional);
     const replenishScore = Math.min(25, Math.round(replenishRatio * 14));
@@ -1963,13 +2073,13 @@ export class OrderbookEngine {
       else if (obi.aligned === 'BULL') flowScore -= 10;
     }
 
-    const rrScore = Math.min(15, Math.max(0, Math.round((rrRatio - 1.35) * 8)));
+    const rrScore = Math.min(15, Math.max(0, Math.round((netRrRatio - 1.0) * 12)));
     const rawScore = replenishScore + refillScore + flowScore + rrScore;
     const confidenceScore = Math.min(96, Math.max(42, Math.round(rawScore)));
     const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
       confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
 
-    const riskPct = +((actualRisk / entryPrice) * 100).toFixed(2);
+    const riskPct = +grossRiskPct.toFixed(2);
 
     const card: OpportunityCard = {
       id: `opp-ice-${now}-${price}`,
@@ -1984,21 +2094,27 @@ export class OrderbookEngine {
       targetPrice,
       riskPct,
       rrRatio,
+      netRrRatio,
+      feePct: costProfile.feePct,
+      spreadBps: costProfile.spreadBps,
+      grossPnlPct: 0,
       confidence,
       confidenceScore,
       reasons: [
-        `Anlık Giriş: ${entryPrice} (Emilim Kademesi: ${price}) · Stop: ${stopPrice} · Hedef: ${targetPrice}.`,
-        `Gerçek Likidite Yenilemesi: Tahtaya +$${this.formatCompact(tracker.replenishedNotional)} yeni limit emir enjekte edildi (${tracker.refillCount}× yenilenme).`,
-        `Pencere Emilimi: 30s içinde $${this.formatCompact(tracker.tradedNotional)} karşılandı; tahta derinliği korundu.`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Dinamik R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Anlık Giriş: ${entryPrice} (Emilim: ${price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
+        `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
+        `Gerçek Likidite Yenilemesi: Tahtaya +$${this.formatCompact(tracker.replenishedNotional)} yeni limit emir eklendi (${tracker.refillCount}× yenilenme, $${this.formatCompact(tracker.tradedNotional)} karşılandı).`,
+        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
-      currentPrice: entryPrice,
+      currentPrice: initialExecExit,
+      postEntryHigh: initialExecExit,
+      postEntryLow: initialExecExit,
       progressPct: 0,
-      pnlPct: 0,
+      pnlPct: -+costProfile.totalCostPct.toFixed(2),
       durationSec: 0,
-      maxDurationSec: 180,
+      maxDurationSec: 240,
     };
 
     this.opportunities.unshift(card);
@@ -2025,12 +2141,22 @@ export class OrderbookEngine {
     if (existing) return;
 
     const mid = this.midPrice || price;
-    const entryPrice = +mid.toFixed(this.precision);
+    const costProfile = this.getExecutionCostProfile(mid);
+    if (costProfile.spreadBps > 25) return;
 
-    // Stop Loss: Tight scalp invalidation (6.5 bps outside entry, clamped to 4.5 - 18 bps)
-    const minRisk = Math.max(this.tickSize * 2, entryPrice * 0.0005);
-    const maxRisk = Math.max(this.tickSize * 6, entryPrice * 0.0018);
-    const risk = Math.min(maxRisk, Math.max(minRisk, entryPrice * 0.0007));
+    const entryPrice = +mid.toFixed(this.precision);
+    const initialExecExit = costProfile.bookValid
+      ? +(bias === 'LONG' ? this.bestBid : this.bestAsk).toFixed(this.precision)
+      : entryPrice;
+
+    // Stop Loss: Strictly >= 3.0x total execution cost (commission + half-spread) and >= 28 bps
+    const minRisk = Math.max(
+      this.tickSize * 4,
+      entryPrice * 0.0028,
+      costProfile.totalCostPrice * OrderbookEngine.MIN_STOP_COST_MULTIPLE
+    );
+    const maxRisk = Math.max(minRisk * 1.8, entryPrice * 0.0065);
+    const risk = Math.min(maxRisk, Math.max(minRisk, minRisk * 1.15));
 
     const stopPrice =
       bias === 'LONG'
@@ -2039,11 +2165,13 @@ export class OrderbookEngine {
 
     const actualRisk = Math.abs(entryPrice - stopPrice);
     if (actualRisk <= 0) return;
+    const actualRiskBps = (actualRisk / entryPrice) * 10000;
+    if (actualRiskBps < costProfile.totalCostBps * 2.5) return;
 
     const cvd = this.getMultiCVD();
     const obi = this.getMultiOBI();
 
-    // Target: Structural target towards opposing wall within [1.4R, 2.8R] or dynamic 1:1.9 R:R
+    // Target: Structural target towards opposing wall within [1.8R, 3.2R] or dynamic 1:2.2 R:R
     let targetPrice = entryPrice;
     let usedStructural = false;
     const oppSide = bias === 'LONG' ? 'A' : 'B';
@@ -2053,19 +2181,19 @@ export class OrderbookEngine {
 
     if (oppWalls.length > 0) {
       const oppWall = oppWalls[0];
-      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.00025);
+      const targetBuffer = Math.max(this.tickSize, oppWall.price * 0.0003);
       const candidateTarget =
         bias === 'LONG'
           ? +(oppWall.price - targetBuffer).toFixed(this.precision)
           : +(oppWall.price + targetBuffer).toFixed(this.precision);
       const dist = Math.abs(candidateTarget - entryPrice);
-      if (dist >= actualRisk * 1.4 && dist <= actualRisk * 2.8) {
+      if (dist >= actualRisk * 1.8 && dist <= actualRisk * 3.2) {
         targetPrice = candidateTarget;
         usedStructural = true;
       }
     }
     if (!usedStructural) {
-      const dynamicMultiplier = 1.9;
+      const dynamicMultiplier = 2.2;
       targetPrice =
         bias === 'LONG'
           ? +(entryPrice + actualRisk * dynamicMultiplier).toFixed(this.precision)
@@ -2074,17 +2202,23 @@ export class OrderbookEngine {
 
     const reward = Math.abs(targetPrice - entryPrice);
     const rrRatio = +(reward / actualRisk).toFixed(2);
-    if (rrRatio < 1.3) return;
+    const grossRewardPct = (reward / entryPrice) * 100;
+    const grossRiskPct = (actualRisk / entryPrice) * 100;
+    const netRewardPct = +(grossRewardPct - costProfile.totalCostPct).toFixed(2);
+    const netRiskPct = +(grossRiskPct + costProfile.totalCostPct).toFixed(2);
+    const netRrRatio = netRiskPct > 0 ? +(netRewardPct / netRiskPct).toFixed(2) : 0;
+
+    if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
     const divStrengthScore = Math.min(30, Math.round((Math.abs(cvdNotional) / Math.max(1, this.effectiveCvdThreshold)) * 18));
     const obiScore = bias === 'LONG' && obi.aligned === 'BULL' ? 20 : bias === 'SHORT' && obi.aligned === 'BEAR' ? 20 : 10;
-    const rrScore = Math.min(20, Math.round((rrRatio - 1.3) * 10));
+    const rrScore = Math.min(20, Math.round((netRrRatio - 1.0) * 12));
 
     const confidenceScore = Math.min(96, Math.max(50, divStrengthScore + obiScore + rrScore + 20));
     const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
       confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
 
-    const riskPct = +((actualRisk / entryPrice) * 100).toFixed(2);
+    const riskPct = +grossRiskPct.toFixed(2);
 
     const card: OpportunityCard = {
       id: `opp-div-${now}-${price}`,
@@ -2097,21 +2231,27 @@ export class OrderbookEngine {
       targetPrice,
       riskPct,
       rrRatio,
+      netRrRatio,
+      feePct: costProfile.feePct,
+      spreadBps: costProfile.spreadBps,
+      grossPnlPct: 0,
       confidence,
       confidenceScore,
       reasons: [
         `Net Akış Uyumsuzluğu: Fiyat %${priceDeltaPct.toFixed(2)} hareket ederken 60s CVD $${this.formatCompact(cvdNotional)} baskı üretti.`,
-        `Kurumsal Emilim: Akımların fiyatı itemediği emilim bölgesi tespit edildi; dönüş yönüne pozisyon alındı.`,
-        `Anlık Giriş: ${entryPrice} · Stop: ${stopPrice} · Hedef: ${targetPrice}.`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Anlık Giriş: ${entryPrice} · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
+        `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
+        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
-      currentPrice: entryPrice,
+      currentPrice: initialExecExit,
+      postEntryHigh: initialExecExit,
+      postEntryLow: initialExecExit,
       progressPct: 0,
-      pnlPct: 0,
+      pnlPct: -+costProfile.totalCostPct.toFixed(2),
       durationSec: 0,
-      maxDurationSec: 180,
+      maxDurationSec: 240,
     };
 
     this.opportunities.unshift(card);
@@ -2122,27 +2262,37 @@ export class OrderbookEngine {
 
   // Active Opportunity Card Real-time Lifecycle Tracker:
   // Evaluates every price tick / L2 top-of-book / kline update against active cards:
-  // - Updates live currentPrice, pnlPct, progressPct (-100% to +100%), and durationSec while ACTIVE
-  // - HIT_TARGET: Price reaches or exceeds the calculated targetPrice
-  // - STOPPED: Price breaches the defensive stop loss level
-  // - EXPIRED: Opportunity has been active for >= maxDurationSec (180s) without hitting TP/SL
+  // - Uses real executable exit prices: BID for LONG exits, ASK for SHORT exits
+  // - Tracks running postEntryHigh / postEntryLow strictly AFTER card.timestamp (ignoring pre-card candle highs/lows)
+  // - Computes Net PnL (pnlPct) deducting round-trip Taker commission (10 bps = 0.10%) and half-spread
+  // - HIT_TARGET: Post-entry executable price reaches targetPrice
+  // - STOPPED: Post-entry executable price breaches stopPrice
+  // - EXPIRED: Opportunity has been active for >= maxDurationSec (240s) without hitting TP/SL
   public checkActiveOpportunitiesLifecycle(
     currentPrice: number,
     now = Date.now(),
-    highPrice?: number,
-    lowPrice?: number
+    klineCandle?: { openTimeMs: number; high: number; low: number }
   ) {
     if (!currentPrice || !this.opportunities.length) return;
 
     let anyResolved = false;
+    const liveCost = this.getExecutionCostProfile(currentPrice);
 
     for (const card of this.opportunities) {
       if (card.status !== 'ACTIVE') continue;
 
-      const maxDur = card.maxDurationSec || 180;
+      // Ignore any stale event timestamped prior to card creation
+      if (now < card.timestamp) continue;
+
+      const maxDur = card.maxDurationSec || 240;
       const durationSec = Math.max(0, Math.round((now - card.timestamp) / 1000));
       card.maxDurationSec = maxDur;
       card.durationSec = durationSec;
+
+      const feePct = card.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT;
+      const spreadBps = card.spreadBps ?? liveCost.spreadBps;
+      const halfSpreadPct = (spreadBps / 2) / 100;
+      const totalCostPct = feePct + halfSpreadPct;
 
       // If card belongs to a different symbol than currently active book, expire it if past lifespan
       if (card.symbol !== this.symbol) {
@@ -2150,7 +2300,7 @@ export class OrderbookEngine {
           card.status = 'EXPIRED';
           card.exitPrice = card.currentPrice || card.entryPrice;
           card.resolvedAt = now;
-          card.pnlPct = card.pnlPct ?? 0;
+          card.pnlPct = card.pnlPct ?? -+totalCostPct.toFixed(2);
           anyResolved = true;
           if (this.onOpportunityUpdated) this.onOpportunityUpdated(card);
         }
@@ -2163,105 +2313,155 @@ export class OrderbookEngine {
       }
 
       const bookValid = this.depthReady && this.bestBid > 0 && this.bestAsk > this.bestBid;
-      const checkHigh = Math.max(
-        currentPrice,
-        highPrice || currentPrice,
-        bookValid ? this.bestBid : currentPrice
-      );
-      const checkLow = Math.min(
-        currentPrice,
-        lowPrice || currentPrice,
-        bookValid ? this.bestAsk : currentPrice
-      );
+      const halfSpreadPrice = bookValid
+        ? (this.bestAsk - this.bestBid) / 2
+        : card.entryPrice * (halfSpreadPct / 100);
 
-      card.currentPrice = +currentPrice.toFixed(this.precision);
+      // CRITICAL: Only use kline high/low if the candle itself opened AT OR AFTER card.timestamp!
+      // If the candle opened before the card was created, its high/low includes historical pre-card prices.
+      const klineOpenedAfterCard =
+        klineCandle !== undefined && klineCandle.openTimeMs >= card.timestamp;
+
       let resolved = false;
 
       if (card.bias === 'LONG') {
-        const livePnl = +(((currentPrice - card.entryPrice) / card.entryPrice) * 100).toFixed(2);
-        card.pnlPct = livePnl;
+        // LONG real exit is strictly on the BID side (bestBid)
+        const execBid = bookValid
+          ? this.bestBid
+          : +(currentPrice - halfSpreadPrice).toFixed(this.precision);
+        const tickBidHigh = Math.max(
+          execBid,
+          currentPrice - halfSpreadPrice,
+          klineOpenedAfterCard ? klineCandle.high - halfSpreadPrice : execBid
+        );
+        const tickBidLow = Math.min(
+          execBid,
+          currentPrice - halfSpreadPrice,
+          klineOpenedAfterCard ? klineCandle.low - halfSpreadPrice : execBid
+        );
 
-        if (currentPrice >= card.entryPrice) {
+        card.postEntryHigh = Math.max(card.postEntryHigh ?? execBid, tickBidHigh);
+        card.postEntryLow = Math.min(card.postEntryLow ?? execBid, tickBidLow);
+
+        const checkHigh = card.postEntryHigh;
+        const checkLow = card.postEntryLow;
+
+        card.currentPrice = +execBid.toFixed(this.precision);
+        const grossMovePct = ((currentPrice - card.entryPrice) / card.entryPrice) * 100;
+        // Since execBid = mid - spread/2, ((execBid - entryPrice) / entryPrice) * 100 already includes -halfSpreadPct!
+        const execMovePct = ((execBid - card.entryPrice) / card.entryPrice) * 100;
+        card.grossPnlPct = +grossMovePct.toFixed(2);
+        card.pnlPct = +(execMovePct - feePct).toFixed(2);
+
+        if (execBid >= card.entryPrice) {
           const targetDist = Math.max(1e-9, card.targetPrice - card.entryPrice);
-          card.progressPct = Math.min(100, Math.round(((currentPrice - card.entryPrice) / targetDist) * 100));
+          card.progressPct = Math.min(100, Math.round(((execBid - card.entryPrice) / targetDist) * 100));
         } else {
           const stopDist = Math.max(1e-9, card.entryPrice - card.stopPrice);
-          card.progressPct = Math.max(-100, -Math.round(((card.entryPrice - currentPrice) / stopDist) * 100));
+          card.progressPct = Math.max(-100, -Math.round(((card.entryPrice - execBid) / stopDist) * 100));
         }
 
-        // Target reached: Price rose to or above target
+        // Target reached: Executable Bid price rose to or above targetPrice
         if (checkHigh >= card.targetPrice) {
-          const fillPrice = +Math.max(card.targetPrice, currentPrice).toFixed(this.precision);
+          const fillPrice = +Math.max(card.targetPrice, execBid).toFixed(this.precision);
+          const grossPnl = ((fillPrice - card.entryPrice) / card.entryPrice) * 100;
           card.status = 'HIT_TARGET';
           card.exitPrice = fillPrice;
           card.currentPrice = fillPrice;
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = 100;
-          card.pnlPct = +(((fillPrice - card.entryPrice) / card.entryPrice) * 100).toFixed(2);
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
         } else if (checkLow <= card.stopPrice) {
-          // Stopped: Price fell to or below stop loss
-          const fillPrice = +Math.min(card.stopPrice, currentPrice).toFixed(this.precision);
+          // Stopped: Executable Bid price fell to or below stopPrice
+          const fillPrice = +Math.min(card.stopPrice, execBid).toFixed(this.precision);
+          const grossPnl = ((fillPrice - card.entryPrice) / card.entryPrice) * 100;
           card.status = 'STOPPED';
           card.exitPrice = fillPrice;
           card.currentPrice = fillPrice;
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = -100;
-          card.pnlPct = +(((fillPrice - card.entryPrice) / card.entryPrice) * 100).toFixed(2);
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
         }
       } else {
-        // SHORT bias
-        const livePnl = +(((card.entryPrice - currentPrice) / card.entryPrice) * 100).toFixed(2);
-        card.pnlPct = livePnl;
+        // SHORT real exit is strictly on the ASK side (bestAsk)
+        const execAsk = bookValid
+          ? this.bestAsk
+          : +(currentPrice + halfSpreadPrice).toFixed(this.precision);
+        const tickAskHigh = Math.max(
+          execAsk,
+          currentPrice + halfSpreadPrice,
+          klineOpenedAfterCard ? klineCandle.high + halfSpreadPrice : execAsk
+        );
+        const tickAskLow = Math.min(
+          execAsk,
+          currentPrice + halfSpreadPrice,
+          klineOpenedAfterCard ? klineCandle.low + halfSpreadPrice : execAsk
+        );
 
-        if (currentPrice <= card.entryPrice) {
+        card.postEntryHigh = Math.max(card.postEntryHigh ?? execAsk, tickAskHigh);
+        card.postEntryLow = Math.min(card.postEntryLow ?? execAsk, tickAskLow);
+
+        const checkHigh = card.postEntryHigh;
+        const checkLow = card.postEntryLow;
+
+        card.currentPrice = +execAsk.toFixed(this.precision);
+        const grossMovePct = ((card.entryPrice - currentPrice) / card.entryPrice) * 100;
+        // Since execAsk = mid + spread/2, ((entryPrice - execAsk) / entryPrice) * 100 already includes -halfSpreadPct!
+        const execMovePct = ((card.entryPrice - execAsk) / card.entryPrice) * 100;
+        card.grossPnlPct = +grossMovePct.toFixed(2);
+        card.pnlPct = +(execMovePct - feePct).toFixed(2);
+
+        if (execAsk <= card.entryPrice) {
           const targetDist = Math.max(1e-9, card.entryPrice - card.targetPrice);
-          card.progressPct = Math.min(100, Math.round(((card.entryPrice - currentPrice) / targetDist) * 100));
+          card.progressPct = Math.min(100, Math.round(((card.entryPrice - execAsk) / targetDist) * 100));
         } else {
           const stopDist = Math.max(1e-9, card.stopPrice - card.entryPrice);
-          card.progressPct = Math.max(-100, -Math.round(((currentPrice - card.entryPrice) / stopDist) * 100));
+          card.progressPct = Math.max(-100, -Math.round(((execAsk - card.entryPrice) / stopDist) * 100));
         }
 
-        // Target reached: Price fell to or below target
+        // Target reached: Executable Ask price fell to or below targetPrice
         if (checkLow <= card.targetPrice) {
-          const fillPrice = +Math.min(card.targetPrice, currentPrice).toFixed(this.precision);
+          const fillPrice = +Math.min(card.targetPrice, execAsk).toFixed(this.precision);
+          const grossPnl = ((card.entryPrice - fillPrice) / card.entryPrice) * 100;
           card.status = 'HIT_TARGET';
           card.exitPrice = fillPrice;
           card.currentPrice = fillPrice;
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = 100;
-          card.pnlPct = +(((card.entryPrice - fillPrice) / card.entryPrice) * 100).toFixed(2);
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
         } else if (checkHigh >= card.stopPrice) {
-          // Stopped: Price rose to or above stop loss
-          const fillPrice = +Math.max(card.stopPrice, currentPrice).toFixed(this.precision);
+          // Stopped: Executable Ask price rose to or above stopPrice
+          const fillPrice = +Math.max(card.stopPrice, execAsk).toFixed(this.precision);
+          const grossPnl = ((card.entryPrice - fillPrice) / card.entryPrice) * 100;
           card.status = 'STOPPED';
           card.exitPrice = fillPrice;
           card.currentPrice = fillPrice;
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = -100;
-          card.pnlPct = +(((card.entryPrice - fillPrice) / card.entryPrice) * 100).toFixed(2);
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
         }
       }
 
-      // Scalp Expiry check: If trade has not hit target or stop within maxDurationSec (180s), retire as EXPIRED
+      // Scalp Expiry check: If trade has not hit target or stop within maxDurationSec (240s), retire as EXPIRED at executable Bid/Ask
       if (!resolved && durationSec >= maxDur) {
-        const fillPrice = +currentPrice.toFixed(this.precision);
+        const execFill = card.currentPrice ?? +currentPrice.toFixed(this.precision);
         card.status = 'EXPIRED';
-        card.exitPrice = fillPrice;
-        card.currentPrice = fillPrice;
+        card.exitPrice = execFill;
         card.resolvedAt = now;
         card.durationSec = durationSec;
-        card.pnlPct =
-          card.bias === 'LONG'
-            ? +(((fillPrice - card.entryPrice) / card.entryPrice) * 100).toFixed(2)
-            : +(((card.entryPrice - fillPrice) / card.entryPrice) * 100).toFixed(2);
+        // card.pnlPct and card.grossPnlPct are already computed from execBid/execAsk minus feePct above
         resolved = true;
       }
 
