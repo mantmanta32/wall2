@@ -5,7 +5,7 @@ import { OrderFlowHUD } from './components/OrderFlowHUD';
 import { FavoritesView } from './components/FavoritesView';
 import { SettingsView } from './components/SettingsView';
 import { BottomNav, ActiveTab } from './components/BottomNav';
-import { Candle, AppSettings, LiquidityTier, MultiCVDState, MultiOBIState, OpportunityCard } from './types/market';
+import { Candle, AppSettings, LiquidityTier, MultiCVDState, MultiOBIState, OpportunityCard, OpportunityStats } from './types/market';
 import { OrderbookEngine } from './services/orderbookEngine';
 import { BinanceWsManager } from './services/binanceWs';
 import {
@@ -61,6 +61,7 @@ export default function App() {
   const [lastPrice, setLastPrice] = useState<number>(0.24499);
   const [priceChangePercent, setPriceChangePercent] = useState<number>(-3.42);
   const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isDepthSynced, setIsDepthSynced] = useState<boolean>(false);
   const [favorites, setFavorites] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('orderbook_favs');
@@ -103,14 +104,27 @@ export default function App() {
     'NOTR' | 'AL' | 'SAT' | 'SAVUNULDU' | 'SWEEP' | 'ICEBERG' | 'SPOOF' | 'DIVERGENCE'
   >('NOTR');
   const [activeOpportunity, setActiveOpportunity] = useState<OpportunityCard | null>(null);
-  const [opportunityStats, setOpportunityStats] = useState({
+  const [opportunityStats, setOpportunityStats] = useState<OpportunityStats>({
     total: 0,
     activeCount: 0,
     hitCount: 0,
     stopCount: 0,
     expiredCount: 0,
+    cancelledCount: 0,
     resolvedCount: 0,
+    winCount: 0,
+    lossCount: 0,
     winRate: 0,
+    targetHitRate: 0,
+    initialEquity: 1000,
+    currentEquity: 1000,
+    netProfitUsdt: 0,
+    equityReturnPct: 0,
+    compoundedPnLPct: 0,
+    totalR: 0,
+    expectancyR: 0,
+    maxDrawdownPct: 0,
+    equityCurve: [],
     totalPnL: 0,
   });
   const statusTimerRef = useRef<number | null>(null);
@@ -360,6 +374,7 @@ export default function App() {
     lastPriceRef.current = 0;
     pinnedOppRef.current = null;
     engine.reset(symbol);
+    setIsDepthSynced(false);
     if (metaMap[symbol]) {
       engine.setSymbolMeta(metaMap[symbol].tickSize, metaMap[symbol].precision);
     }
@@ -393,18 +408,23 @@ export default function App() {
     wsManagerRef.current = ws;
 
     ws.onConnectionChange = (conn) => {
-      if (!isCancelled) setIsConnected(conn);
+      if (!isCancelled) {
+        setIsConnected(conn);
+        setIsDepthSynced(ws.isDepthConnected && engine.isOrderbookSynced());
+      }
     };
 
     ws.onKlineUpdate = (updatedCandle) => {
       if (isCancelled) return;
       lastPriceRef.current = updatedCandle.close;
       setLastPrice(updatedCandle.close);
-      engine.checkActiveOpportunitiesLifecycle(updatedCandle.close, Date.now(), {
-        openTimeMs: updatedCandle.time * 1000,
-        high: updatedCandle.high,
-        low: updatedCandle.low,
-      });
+      if (engine.isOrderbookSynced()) {
+        engine.checkActiveOpportunitiesLifecycle(updatedCandle.close, Date.now(), {
+          openTimeMs: updatedCandle.time * 1000,
+          high: updatedCandle.high,
+          low: updatedCandle.low,
+        });
+      }
       setCandles((prev) => {
         if (!prev.length) return [updatedCandle];
         const last = prev[prev.length - 1];
@@ -432,9 +452,10 @@ export default function App() {
     const telemetryTimer = window.setInterval(() => {
       if (isCancelled) return;
       const now = Date.now();
-      const evalPrice = engine.midPrice || lastPriceRef.current;
-      if (evalPrice > 0) {
-        engine.checkActiveOpportunitiesLifecycle(evalPrice, now);
+      const bookSynced = ws.isDepthConnected && engine.isOrderbookSynced();
+      setIsDepthSynced(bookSynced);
+      if (bookSynced && engine.midPrice > 0) {
+        engine.checkActiveOpportunitiesLifecycle(engine.midPrice, now);
       }
 
       // Synchronize live Active Opportunity Pill state deterministically:
@@ -457,6 +478,7 @@ export default function App() {
           (o) =>
             o.symbol === symbol &&
             o.status !== 'ACTIVE' &&
+            o.status !== 'CANCELLED' &&
             !dismissedOppIdsRef.current.has(o.id) &&
             o.resolvedAt !== undefined &&
             now - o.resolvedAt < 6500
@@ -531,6 +553,7 @@ export default function App() {
         lastPrice={lastPrice}
         priceChangePercent={priceChangePercent}
         isConnected={isConnected}
+        isDepthSynced={isDepthSynced}
         isFavorite={favorites.includes(symbol)}
         onSelectSymbol={handleSelectSymbol}
         onToggleFavorite={handleToggleFavorite}
@@ -592,6 +615,7 @@ export default function App() {
             <div className="flex-1 relative overflow-hidden">
               <OrderFlowHUD
                 marketStatus={marketStatus}
+                isDepthSynced={isDepthSynced}
                 activeOpportunity={activeOpportunity}
                 opportunityStats={opportunityStats}
                 allOpportunities={engine.opportunities}

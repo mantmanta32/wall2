@@ -1,4 +1,5 @@
-import { AggTrade, FlowEvent, ForceOrder, LiquidityTier, MultiCVDState, MultiOBIState, OpportunityCard, WallRecord } from '../types/market';
+import { AggTrade, ConfidenceBucketStats, ConfidenceCalibration, ConfidenceFactors, EquityPoint, FlowEvent, ForceOrder, LiquidityTier, MultiCVDState, MultiOBIState, OpportunityCard, OpportunityStats, SignalTypeStats, WallRecord } from '../types/market';
+import type { WorkerAnalyzeRequest, WorkerAnalyzeResponse, WorkerCandidate } from '../workers/orderbookWorker';
 
 export interface HeatmapBin {
   side: 'B' | 'A';
@@ -76,6 +77,13 @@ export class OrderbookEngine {
   // Liquidity depth profile frames
   public heatmapFrames: HeatmapFrame[] = [];
   private lastHeatSampleTs = 0;
+  private lastWallDetectTs = 0;
+  private lastObiSampleTs = 0;
+
+  // Off-thread Web Worker for O(N log N) percentile sorting, wall candidate filtering, OBI & heatmap binning
+  private worker: Worker | null = null;
+  private workerBusy = false;
+  private workerSeq = 0;
 
   // Trades & Liquidations
   public trades: AggTrade[] = [];
@@ -122,6 +130,17 @@ export class OrderbookEngine {
   public onEventCreated?: (event: FlowEvent) => void;
   public onOpportunityCreated?: (opp: OpportunityCard) => void;
   public onOpportunityUpdated?: (opp: OpportunityCard) => void;
+  public onSyncStateChange?: (synced: boolean) => void;
+
+  public isOrderbookSynced(): boolean {
+    return (
+      this.depthReady &&
+      this.isSnapshotLoaded &&
+      this.depthSynced &&
+      this.bestBid > 0 &&
+      this.bestAsk > this.bestBid
+    );
+  }
 
   // Standard Binance USDT-M Futures VIP0 Taker fee: 0.05% (5 bps) per leg -> 0.10% (10 bps) round-trip
   private static readonly ROUND_TRIP_TAKER_FEE_PCT = 0.10; // 0.10% (10 bps)
@@ -143,11 +162,52 @@ export class OrderbookEngine {
     this.symbol = symbol;
     this.tickSize = tickSize;
     this.precision = precision;
+    this.initWorker();
     this.loadSavedOpportunities();
     if (initialSettings) {
       this.updateSettings(initialSettings);
     } else {
       this.recalibrateThresholds();
+    }
+  }
+
+  private initWorker() {
+    try {
+      if (typeof Worker !== 'undefined') {
+        this.worker = new Worker(new URL('../workers/orderbookWorker.ts', import.meta.url), {
+          type: 'module',
+        });
+        this.worker.onmessage = (event: MessageEvent<WorkerAnalyzeResponse>) => {
+          this.workerBusy = false;
+          const res = event.data;
+          if (!res || res.type !== 'ANALYZE_RESULT' || res.seq < this.workerSeq) return;
+          if (!this.depthReady || !this.midPrice) return;
+
+          // 1. Apply off-thread Distance-Weighted OBI snapshot
+          this.obiSnapshots.push({ ts: res.now, obi: res.obi });
+          const cutoff = res.now - 180000;
+          while (this.obiSnapshots.length && this.obiSnapshots[0].ts < cutoff) {
+            this.obiSnapshots.shift();
+          }
+
+          // 2. Apply off-thread filtered & percentile-thresholded wall candidates
+          this.applyWallCandidates(res.threshold, res.candidates, res.now);
+
+          // 3. Apply off-thread sorted heatmap bins if computed
+          if (res.heatmap) {
+            this.heatmapFrames.push(res.heatmap);
+            const minSec = Math.floor(res.now / 1000) - 900;
+            while (this.heatmapFrames.length && this.heatmapFrames[0].t < minSec) {
+              this.heatmapFrames.shift();
+            }
+          }
+        };
+        this.worker.onerror = () => {
+          this.workerBusy = false;
+        };
+      }
+    } catch {
+      this.worker = null;
     }
   }
 
@@ -158,21 +218,35 @@ export class OrderbookEngine {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         const now = Date.now();
-        this.opportunities = parsed.slice(0, 60).map((card: OpportunityCard) => {
+        this.opportunities = parsed.slice(0, 150).map((card: OpportunityCard) => {
           const maxDur = card.maxDurationSec || 240;
           const elapsedSec = Math.max(1, Math.round((now - card.timestamp) / 1000));
+          let nextCard: OpportunityCard = card;
+          // If card was left ACTIVE across a symbol change or offline session reload, mark as CANCELLED (not EXPIRED) so it doesn't distort stats
           if (card.status === 'ACTIVE' && (elapsedSec >= maxDur || card.symbol !== this.symbol)) {
-            return {
+            nextCard = {
               ...card,
-              status: 'EXPIRED',
+              status: 'CANCELLED',
               exitPrice: card.currentPrice || card.entryPrice,
-              resolvedAt: card.timestamp + maxDur * 1000,
+              resolvedAt: now,
               durationSec: Math.min(elapsedSec, maxDur),
-              pnlPct: card.pnlPct ?? -(card.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT),
+              pnlPct: card.pnlPct ?? 0,
               progressPct: card.progressPct ?? 0,
             };
           }
-          return card;
+          // Backfill standardized factors and calibrate legacy cards that were created with uncalibrated heuristic weights
+          if (!nextCard.factors) {
+            const inferred = this.inferLegacyCardFactors(nextCard);
+            const cal = this.computeCalibratedConfidence(nextCard.type, inferred, nextCard.id);
+            nextCard = {
+              ...nextCard,
+              factors: inferred,
+              rawConfidenceScore: nextCard.rawConfidenceScore ?? nextCard.confidenceScore,
+              confidenceScore: cal.confidenceScore,
+              confidence: cal.confidence,
+            };
+          }
+          return nextCard;
         });
       }
     } catch {
@@ -182,7 +256,7 @@ export class OrderbookEngine {
 
   public saveOpportunities() {
     try {
-      localStorage.setItem('orderbook_opportunities_v2', JSON.stringify(this.opportunities.slice(0, 60)));
+      localStorage.setItem('orderbook_opportunities_v2', JSON.stringify(this.opportunities.slice(0, 150)));
     } catch {
       // Ignore storage errors
     }
@@ -198,7 +272,7 @@ export class OrderbookEngine {
     this.tickSize = tickSize;
     this.precision = precision;
     if (changed && this.depthReady) {
-      this.detectWalls();
+      this.detectWalls(true);
     }
   }
 
@@ -222,7 +296,7 @@ export class OrderbookEngine {
     }
     this.recalibrateThresholds();
     if (this.depthReady) {
-      this.detectWalls();
+      this.detectWalls(true);
     }
   }
 
@@ -231,7 +305,7 @@ export class OrderbookEngine {
       this.quoteVolume24h = quoteVolume;
       this.recalibrateThresholds();
       if (this.depthReady) {
-        this.detectWalls();
+        this.detectWalls(true);
       }
     }
   }
@@ -357,19 +431,23 @@ export class OrderbookEngine {
     this.walls = [];
     this.wallAges.clear();
     this.heatmapFrames = [];
+    this.lastWallDetectTs = 0;
+    this.lastObiSampleTs = 0;
+    this.lastHeatSampleTs = 0;
+    this.workerSeq++;
+    this.workerBusy = false;
     this.trades = [];
     this.liqs = [];
     this.events = [];
-    // Preserve resolved opportunities for win-rate analytics; expire any active cards from a previous symbol
+    // Preserve resolved opportunities for win-rate analytics; mark any active cards from a previous symbol as CANCELLED (user symbol switch, excluded from stats)
     this.loadSavedOpportunities();
     const now = Date.now();
     for (const card of this.opportunities) {
       if (card.status === 'ACTIVE' && card.symbol !== this.symbol) {
-        card.status = 'EXPIRED';
+        card.status = 'CANCELLED';
         card.exitPrice = card.currentPrice || card.entryPrice;
         card.resolvedAt = now;
         card.durationSec = Math.max(1, Math.round((now - card.timestamp) / 1000));
-        card.pnlPct = card.pnlPct ?? 0;
       }
     }
     this.saveOpportunities();
@@ -400,12 +478,26 @@ export class OrderbookEngine {
   public lastSyncTs = 0;
 
   // Prepare engine to buffer incoming WS depth updates before/during snapshot fetch
+  // Strictly invalidates depthReady and clears stale book state so neither the UI nor lifecycle tracker runs on stale depth
   public beginDepthSync(clearBuffer = false) {
     this.isSnapshotLoaded = false;
     this.depthSynced = false;
+    this.depthReady = false;
     this.hasBridgedFirstEvent = false;
+    this.workerSeq++;
+    this.workerBusy = false;
+    this.bidsBook.clear();
+    this.asksBook.clear();
+    this.bestBid = 0;
+    this.bestAsk = 0;
+    this.spread = 0;
+    this.midPrice = 0;
+    this.walls = [];
     if (clearBuffer) {
       this.pendingDepthEvents = [];
+    }
+    if (this.onSyncStateChange) {
+      this.onSyncStateChange(false);
     }
   }
 
@@ -436,10 +528,8 @@ export class OrderbookEngine {
           `[OrderbookEngine] Snapshot (${lastUpdateId}) is older than earliest buffered WS event (U=${firstEv.U}, pu=${firstEv.pu}). Retrying snapshot...`
         );
         // Keep buffering and signal caller to fetch a fresher snapshot
+        this.beginDepthSync(false);
         this.pendingDepthEvents = postSnapEvents;
-        this.isSnapshotLoaded = false;
-        this.depthSynced = false;
-        this.hasBridgedFirstEvent = false;
         return false;
       }
     }
@@ -448,51 +538,59 @@ export class OrderbookEngine {
     this.bidsBook.clear();
     this.asksBook.clear();
     const activeKeys = new Set<string>();
+    const candidateFloor = this.effectiveWallFloor * 0.5;
 
     for (const [p, q] of bids) {
       if (q > 0 && Number.isFinite(p) && p > 0) {
         this.bidsBook.set(p, q);
-        const key = `B|${p}`;
-        activeKeys.add(key);
-        const existing = this.wallAges.get(key);
-        if (existing) {
-          existing.peak = Math.max(existing.peak, p * q);
-          existing.lastSeenTs = now;
-        } else {
-          this.wallAges.set(key, {
-            born: now,
-            peak: p * q,
-            touches: 0,
-            traded: 0,
-            lastSeenTs: now,
-            initialQty: q,
-          });
+        const notional = p * q;
+        // Only store genuine wall candidates in wallAges (never populate all book dust levels)
+        if (notional >= candidateFloor) {
+          const key = `B|${p}`;
+          activeKeys.add(key);
+          const existing = this.wallAges.get(key);
+          if (existing) {
+            existing.peak = Math.max(existing.peak, notional);
+            existing.lastSeenTs = now;
+          } else {
+            this.wallAges.set(key, {
+              born: now,
+              peak: notional,
+              touches: 0,
+              traded: 0,
+              lastSeenTs: now,
+              initialQty: q,
+            });
+          }
         }
       }
     }
     for (const [p, q] of asks) {
       if (q > 0 && Number.isFinite(p) && p > 0) {
         this.asksBook.set(p, q);
-        const key = `A|${p}`;
-        activeKeys.add(key);
-        const existing = this.wallAges.get(key);
-        if (existing) {
-          existing.peak = Math.max(existing.peak, p * q);
-          existing.lastSeenTs = now;
-        } else {
-          this.wallAges.set(key, {
-            born: now,
-            peak: p * q,
-            touches: 0,
-            traded: 0,
-            lastSeenTs: now,
-            initialQty: q,
-          });
+        const notional = p * q;
+        if (notional >= candidateFloor) {
+          const key = `A|${p}`;
+          activeKeys.add(key);
+          const existing = this.wallAges.get(key);
+          if (existing) {
+            existing.peak = Math.max(existing.peak, notional);
+            existing.lastSeenTs = now;
+          } else {
+            this.wallAges.set(key, {
+              born: now,
+              peak: notional,
+              touches: 0,
+              traded: 0,
+              lastSeenTs: now,
+              initialQty: q,
+            });
+          }
         }
       }
     }
 
-    // Prune wallAges entries that no longer exist in the fresh snapshot
+    // Prune wallAges entries that no longer qualify as wall candidates in the fresh snapshot
     for (const key of this.wallAges.keys()) {
       if (!activeKeys.has(key)) {
         this.wallAges.delete(key);
@@ -517,9 +615,9 @@ export class OrderbookEngine {
           console.warn(
             `[OrderbookEngine] Bridge mismatch in buffer: ev.U=${ev.U}, ev.pu=${ev.pu}, lastUpdateId=${this.lastUpdateId}`
           );
-          this.pendingDepthEvents = postSnapEvents.slice(i);
-          this.isSnapshotLoaded = false;
-          this.depthSynced = false;
+          const remaining = postSnapEvents.slice(i);
+          this.beginDepthSync(false);
+          this.pendingDepthEvents = remaining;
           return false;
         }
       } else {
@@ -530,10 +628,9 @@ export class OrderbookEngine {
           console.warn(
             `[OrderbookEngine] Sequence gap inside buffered events: ev.pu=${ev.pu} != lastUpdateId=${this.lastUpdateId}`
           );
-          this.pendingDepthEvents = postSnapEvents.slice(i);
-          this.isSnapshotLoaded = false;
-          this.depthSynced = false;
-          this.hasBridgedFirstEvent = false;
+          const remaining = postSnapEvents.slice(i);
+          this.beginDepthSync(false);
+          this.pendingDepthEvents = remaining;
           return false;
         }
       }
@@ -543,11 +640,14 @@ export class OrderbookEngine {
     this.depthSynced = true;
     this.depthReady = true;
     this.lastSyncTs = now;
-    this.recomputeBest();
+    this.recomputeBest(true);
     this.recalibrateThresholds();
-    this.recordDistanceWeightedObi();
-    this.detectWalls();
+    this.recordDistanceWeightedObi(true);
+    this.detectWalls(true);
     this.sampleHeatmap(true);
+    if (this.onSyncStateChange) {
+      this.onSyncStateChange(this.isOrderbookSynced());
+    }
     return true;
   }
 
@@ -589,7 +689,11 @@ export class OrderbookEngine {
       if (firstU <= this.lastUpdateId + 1 || prevU <= this.lastUpdateId) {
         this.hasBridgedFirstEvent = true;
         this.depthSynced = true;
+        this.depthReady = true;
         this.executeRawDepthUpdate(bids, asks, u, true);
+        if (this.onSyncStateChange) {
+          this.onSyncStateChange(this.isOrderbookSynced());
+        }
       } else {
         // Snapshot was stale relative to the first arriving live event -> buffer and re-sync immediately
         this.triggerSequenceResync(bids, asks, u, firstU, prevU);
@@ -618,9 +722,7 @@ export class OrderbookEngine {
     console.warn(
       `[OrderbookEngine] Packet loss / gap detected: pu (${pu}) > lastUpdateId (${this.lastUpdateId}). Buffering & resyncing snapshot...`
     );
-    this.isSnapshotLoaded = false;
-    this.depthSynced = false;
-    this.hasBridgedFirstEvent = false;
+    this.beginDepthSync(true);
     this.pendingDepthEvents = [
       {
         b: bids,
@@ -646,6 +748,11 @@ export class OrderbookEngine {
   ) {
     const now = Date.now();
 
+    let bestBidInvalidated = false;
+    let bestAskInvalidated = false;
+    const candidateFloor = this.effectiveWallFloor * 0.5;
+    const dustRetireFloor = this.effectiveWallFloor * 0.25;
+
     const processSide = (
       book: Map<number, number>,
       items: [string | number, string | number][],
@@ -663,6 +770,9 @@ export class OrderbookEngine {
         if (q <= 0) {
           if (oldQ > 0) {
             book.delete(p);
+            if (side === 'B' && p === this.bestBid) bestBidInvalidated = true;
+            if (side === 'A' && p === this.bestAsk) bestAskInvalidated = true;
+
             // Check for Wall Sweep vs Spoof Pull
             const ageRec = this.wallAges.get(key);
             const peakNotional = Math.max(oldNotional, ageRec?.peak || 0);
@@ -680,33 +790,39 @@ export class OrderbookEngine {
               }
               const totalExecutedAtLevel = tradedOnRec + recentMatchingTrade;
 
-              // Level was swept if traded volume at the level is significant
+              // Level was swept if traded volume at the level is significant and it wasn't already marked consumed/logged
               const isSweptByTrades =
+                ageRec.status !== 'consumed' &&
                 totalExecutedAtLevel >= Math.min(peakNotional * 0.15, this.effectiveWallMinTraded);
 
               if (isSweptByTrades) {
                 const sweepTakerSide = side === 'B' ? 'sell' : 'buy';
-                this.sweptWallLevels.push({
-                  price: p,
-                  side,
-                  notional: peakNotional,
-                  ts: now,
-                  expireTs: now + 8000,
-                });
-                if (this.sweptWallLevels.length > 20) this.sweptWallLevels.shift();
+                const alreadySweptLevel = this.sweptWallLevels.some(
+                  (sw) => sw.side === side && Math.abs(sw.price - p) <= tol && now - sw.ts < 10000
+                );
+                if (!alreadySweptLevel) {
+                  this.sweptWallLevels.push({
+                    price: p,
+                    side,
+                    notional: peakNotional,
+                    ts: now,
+                    expireTs: now + 8000,
+                  });
+                  if (this.sweptWallLevels.length > 20) this.sweptWallLevels.shift();
+                }
 
-                this.addEvent({
-                  id: `sweep-wall-${now}-${p}`,
-                  type: 'DOM SWEEP',
-                  severity: peakNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
-                  text: `⚡ DOM SWEEP: ${side === 'B' ? 'BİD (Destek)' : 'ASK (Direnç)'} Duvarı Süpürüldü @ ${p} ($${this.formatCompact(peakNotional)} temizlendi, $${this.formatCompact(totalExecutedAtLevel)} emildi)`,
-                  side: sweepTakerSide,
-                  price: p,
-                  ts: now,
-                });
+                // Unified 10-second deduplication across all DOM SWEEP paths so the same sweep is never logged twice
+                this.recordDomSweepEvent(
+                  now,
+                  sweepTakerSide,
+                  p,
+                  tol,
+                  peakNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
+                  `⚡ DOM SWEEP: ${side === 'B' ? 'BİD (Destek)' : 'ASK (Direnç)'} Duvarı Süpürüldü @ ${p} ($${this.formatCompact(peakNotional)} temizlendi, $${this.formatCompact(totalExecutedAtLevel)} emildi)`
+                );
 
                 this.generateVacuumSweepOpportunity(side, p, peakNotional, totalExecutedAtLevel);
-              } else {
+              } else if (ageRec.status !== 'consumed') {
                 // Check for Spoof Pull: Large order cancelled when price was in close proximity without executions
                 const mid = this.midPrice || p;
                 const distancePct = Math.abs(p - mid) / mid;
@@ -736,6 +852,10 @@ export class OrderbookEngine {
         } else {
           const deltaQty = q - oldQ;
           book.set(p, q);
+          // O(1) incremental top-of-book maintenance
+          if (side === 'B' && p > this.bestBid) this.bestBid = p;
+          if (side === 'A' && (this.bestAsk <= 0 || p < this.bestAsk)) this.bestAsk = p;
+
           const notional = p * q;
 
           // True Iceberg Replenishment Tracking:
@@ -755,29 +875,38 @@ export class OrderbookEngine {
             activeIceberg.peakDisplayedNotional = Math.max(activeIceberg.peakDisplayedNotional, notional);
           }
 
-          if (!this.wallAges.has(key)) {
-            this.wallAges.set(key, {
-              born: now,
-              peak: notional,
-              touches: 0,
-              traded: 0,
-              lastSeenTs: now,
-              initialQty: q,
-            });
-          } else {
-            const rec = this.wallAges.get(key)!;
-            // If this price level previously held only minor dust (< 35% of wall floor) and suddenly jumped to a real wall,
-            // reset its born timestamp & peak so a newly placed spoof wall on an old dust level doesn't inherit a fake old age.
-            if (oldNotional < this.effectiveWallFloor * 0.35 && notional >= this.effectiveWallFloor) {
-              rec.born = now;
-              rec.peak = notional;
-              rec.initialQty = q;
-              rec.status = 'active';
-              rec.statusExpireTs = undefined;
-            } else if (notional >= this.effectiveWallFloor * 0.5) {
-              rec.peak = Math.max(rec.peak, notional);
+          // Restrict wallAges strictly to significant wall candidates (>= 50% of effectiveWallFloor)
+          const existingRec = this.wallAges.get(key);
+          if (!existingRec) {
+            if (notional >= candidateFloor) {
+              this.wallAges.set(key, {
+                born: now,
+                peak: notional,
+                touches: 0,
+                traded: 0,
+                lastSeenTs: now,
+                initialQty: q,
+              });
             }
-            rec.lastSeenTs = now;
+          } else {
+            if (
+              notional < dustRetireFloor &&
+              existingRec.status !== 'defended' &&
+              existingRec.status !== 'consumed'
+            ) {
+              this.wallAges.delete(key);
+            } else {
+              if (oldNotional < this.effectiveWallFloor * 0.35 && notional >= this.effectiveWallFloor) {
+                existingRec.born = now;
+                existingRec.peak = notional;
+                existingRec.initialQty = q;
+                existingRec.status = 'active';
+                existingRec.statusExpireTs = undefined;
+              } else if (notional >= candidateFloor) {
+                existingRec.peak = Math.max(existingRec.peak, notional);
+              }
+              existingRec.lastSeenTs = now;
+            }
           }
         }
       }
@@ -788,10 +917,51 @@ export class OrderbookEngine {
 
     if (u) this.lastUpdateId = u;
     if (recompute) {
-      this.recomputeBest();
-      this.recordDistanceWeightedObi();
-      this.detectWalls();
-      this.sampleHeatmap();
+      this.recomputeBest(false, bestBidInvalidated, bestAskInvalidated);
+      this.scheduleBookAnalysis(now);
+    }
+  }
+
+  // Throttled (250ms) Book Analysis Dispatcher:
+  // Offloads full-book percentile sorting, wall candidate filtering, OBI, and heatmap binning to the Web Worker
+  // (or runs throttled synchronous pass if Worker is unavailable).
+  private scheduleBookAnalysis(now = Date.now()) {
+    if (now - this.lastWallDetectTs < 250) return;
+    this.lastWallDetectTs = now;
+
+    if (!this.bestBid || !this.bestAsk || !this.midPrice) {
+      this.walls = [];
+      return;
+    }
+
+    const needHeatmap = now - this.lastHeatSampleTs >= 1000;
+    if (needHeatmap) {
+      this.lastHeatSampleTs = now;
+    }
+
+    if (this.worker && !this.workerBusy) {
+      this.workerBusy = true;
+      const seq = ++this.workerSeq;
+      const req: WorkerAnalyzeRequest = {
+        type: 'ANALYZE_BOOK',
+        seq,
+        now,
+        midPrice: this.midPrice,
+        wallPct: this.wallPct,
+        effectiveWallFloor: this.effectiveWallFloor,
+        needHeatmap,
+        bids: Array.from(this.bidsBook.entries()),
+        asks: Array.from(this.asksBook.entries()),
+      };
+      this.worker.postMessage(req);
+      return;
+    }
+
+    // Fallback if worker is unavailable or busy
+    this.recordDistanceWeightedObi(true);
+    this.detectWalls(true);
+    if (needHeatmap) {
+      this.sampleHeatmap(true);
     }
   }
 
@@ -835,21 +1005,25 @@ export class OrderbookEngine {
       }
     }
 
-    // Quantitative execution tracking against ALL resting depth levels in book (single source of truth, no double-counting)
+    // Quantitative execution tracking against resting wall candidates (O(1) exact lookup + active walls fallback)
     // Taker sell matches against resting Bids; taker buy matches against resting Asks
     const matchSide = trade.side === 'sell' ? 'B' : 'A';
     const exactWallKey = `${matchSide}|${trade.price}`;
     let matchRec = this.wallAges.get(exactWallKey);
     const tol = this.tickSize * 1.5;
-    if (!matchRec) {
+    if (!matchRec && this.walls.length > 0) {
       let bestDist = Infinity;
-      for (const [wKey, wRec] of this.wallAges) {
-        if (wKey.startsWith(matchSide + '|')) {
-          const wPrice = parseFloat(wKey.slice(2));
-          const dist = Math.abs(wPrice - trade.price);
+      // Only check the active detected walls (<= 24 items) instead of scanning all book levels
+      for (let i = 0; i < this.walls.length; i++) {
+        const w = this.walls[i];
+        if (w.side === matchSide) {
+          const dist = Math.abs(w.price - trade.price);
           if (dist <= tol && dist < bestDist) {
-            bestDist = dist;
-            matchRec = wRec;
+            const candidateRec = this.wallAges.get(`${matchSide}|${w.price}`);
+            if (candidateRec) {
+              bestDist = dist;
+              matchRec = candidateRec;
+            }
           }
         }
       }
@@ -866,6 +1040,11 @@ export class OrderbookEngine {
       matchRec.touchHistory = matchRec.touchHistory.filter((t) => now - t.ts <= 30000);
       matchRec.touches = matchRec.touchHistory.length;
       matchRec.traded = matchRec.touchHistory.reduce((acc, t) => acc + t.notional, 0);
+    }
+
+    // Do not run wall execution, iceberg, signal generation, or card lifecycle while orderbook is out of sync
+    if (!this.isOrderbookSynced()) {
+      return;
     }
 
     // Quantitative execution verification & defense/sweep check for prominent walls
@@ -906,6 +1085,34 @@ export class OrderbookEngine {
     this.checkActiveOpportunitiesLifecycle(trade.price, now);
   }
 
+  // Unified 10-second deduplicated DOM SWEEP event emitter used by executeRawDepthUpdate, checkFlowSweep, and evaluateWallState
+  private recordDomSweepEvent(
+    now: number,
+    side: 'buy' | 'sell',
+    price: number,
+    tolerance: number,
+    severity: 'high' | 'medium',
+    text: string
+  ) {
+    const recentDuplicateSweep = this.events.some(
+      (e) =>
+        e.type === 'DOM SWEEP' &&
+        now - e.ts < 10000 &&
+        (e.side === side || (e.price !== undefined && Math.abs(e.price - price) <= Math.max(tolerance * 2, price * 0.0005)))
+    );
+    if (!recentDuplicateSweep) {
+      this.addEvent({
+        id: `sweep-${now}-${price}`,
+        type: 'DOM SWEEP',
+        severity,
+        text,
+        side,
+        price,
+        ts: now,
+      });
+    }
+  }
+
   // Multi-Tick Aggressive DOM Sweep Detector:
   // Detects when market taker orders aggressively sweep through price levels or burst liquidity in < 2000ms
   private checkFlowSweep(now: number, currentTrade: AggTrade) {
@@ -924,15 +1131,14 @@ export class OrderbookEngine {
 
     if (multiTickSweep || volumeBurstSweep) {
       this.lastFlowSweepTs = now;
-      this.addEvent({
-        id: `sweep-flow-${now}-${currentTrade.price}`,
-        type: 'DOM SWEEP',
-        severity: totalSweptNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
-        text: `⚡ DOM SWEEP: ${currentTrade.side === 'buy' ? 'ALIŞ' : 'SATIŞ'} Süpürmesi! ${prices.length > 1 ? `${prices.length} kademe delindi` : 'agresif süpürme'} ($${this.formatCompact(totalSweptNotional)} @ ${currentTrade.price})`,
-        side: currentTrade.side,
-        price: currentTrade.price,
-        ts: now,
-      });
+      this.recordDomSweepEvent(
+        now,
+        currentTrade.side,
+        currentTrade.price,
+        this.tickSize * 2,
+        totalSweptNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
+        `⚡ DOM SWEEP: ${currentTrade.side === 'buy' ? 'ALIŞ' : 'SATIŞ'} Süpürmesi! ${prices.length > 1 ? `${prices.length} kademe delindi` : 'agresif süpürme'} ($${this.formatCompact(totalSweptNotional)} @ ${currentTrade.price})`
+      );
 
       this.generateVacuumSweepOpportunity(
         currentTrade.side === 'buy' ? 'A' : 'B',
@@ -966,20 +1172,38 @@ export class OrderbookEngine {
     }
   }
 
-  // Fast computation of best bid, best ask, spread, and midPrice
-  private recomputeBest() {
-    let bb = 0;
-    let ba = Infinity;
-
-    for (const p of this.bidsBook.keys()) {
-      if (p > bb) bb = p;
+  // Fast O(1) incremental computation of best bid, best ask, spread, and midPrice
+  // Only scans the map when the top-of-book price level itself was deleted or on initial snapshot load
+  private recomputeBest(
+    forceFullScan = false,
+    bestBidInvalidated = false,
+    bestAskInvalidated = false
+  ) {
+    if (
+      forceFullScan ||
+      bestBidInvalidated ||
+      this.bestBid <= 0 ||
+      !this.bidsBook.has(this.bestBid)
+    ) {
+      let bb = 0;
+      for (const p of this.bidsBook.keys()) {
+        if (p > bb) bb = p;
+      }
+      this.bestBid = bb;
     }
-    for (const p of this.asksBook.keys()) {
-      if (p < ba) ba = p;
-    }
 
-    this.bestBid = bb;
-    this.bestAsk = isFinite(ba) ? ba : 0;
+    if (
+      forceFullScan ||
+      bestAskInvalidated ||
+      this.bestAsk <= 0 ||
+      !this.asksBook.has(this.bestAsk)
+    ) {
+      let ba = Infinity;
+      for (const p of this.asksBook.keys()) {
+        if (p < ba) ba = p;
+      }
+      this.bestAsk = isFinite(ba) ? ba : 0;
+    }
 
     if (this.bestBid > 0 && this.bestAsk > 0) {
       if (this.bestAsk > this.bestBid) {
@@ -1008,33 +1232,41 @@ export class OrderbookEngine {
     }
   }
 
-
   // Adaptive Quantitative Wall Detection (Percentile + Absolute Institutional Floor + Age Tracking)
-  public detectWalls() {
+  // Throttled to 250ms unless force=true (e.g. on initial snapshot or settings change)
+  public detectWalls(force = false) {
     if (!this.bestBid || !this.bestAsk || !this.midPrice) {
       this.walls = [];
       return;
     }
 
     const now = Date.now();
+    if (!force && now - this.lastWallDetectTs < 250) return;
+    this.lastWallDetectTs = now;
+
     const mid = this.midPrice;
     const bandRange = mid * 0.05; // 5.0% scalping band around price
+    const minCandidateNotional = this.effectiveWallFloor * 0.5;
     const notionalList: number[] = [];
-    const candidates: { price: number; side: 'B' | 'A'; notional: number }[] = [];
+    const candidates: WorkerCandidate[] = [];
 
     // Filter within visible scalping band
     for (const [p, q] of this.bidsBook) {
       if (Math.abs(p - mid) <= bandRange) {
         const notional = p * q;
         notionalList.push(notional);
-        candidates.push({ price: p, side: 'B', notional });
+        if (notional >= minCandidateNotional) {
+          candidates.push({ price: p, side: 'B', notional });
+        }
       }
     }
     for (const [p, q] of this.asksBook) {
       if (Math.abs(p - mid) <= bandRange) {
         const notional = p * q;
         notionalList.push(notional);
-        candidates.push({ price: p, side: 'A', notional });
+        if (notional >= minCandidateNotional) {
+          candidates.push({ price: p, side: 'A', notional });
+        }
       }
     }
 
@@ -1047,14 +1279,19 @@ export class OrderbookEngine {
     notionalList.sort((a, b) => a - b);
     const pIndex = Math.floor(notionalList.length * (this.wallPct / 100));
     const percentileThreshold = notionalList[Math.min(notionalList.length - 1, pIndex)] || 10000;
-    
-    // Adaptive absolute floor: calibrated to coin liquidity tier
-    const absoluteFloor = this.effectiveWallFloor;
-    const threshold = Math.max(percentileThreshold, absoluteFloor);
+    const threshold = Math.max(percentileThreshold, this.effectiveWallFloor);
 
+    this.applyWallCandidates(threshold, candidates, now);
+  }
+
+  // Shared wall candidate processor used by both Web Worker results and synchronous fallback
+  private applyWallCandidates(threshold: number, candidates: WorkerCandidate[], now: number) {
     const detected: WallRecord[] = [];
+    const activeCandidateKeys = new Set<string>();
+
     for (const c of candidates) {
       const key = `${c.side}|${c.price}`;
+      activeCandidateKeys.add(key);
       const existingRec = this.wallAges.get(key);
 
       // Keep defended or actively-tested walls visible even if absorbing trades slightly lowered their percentile rank
@@ -1099,7 +1336,7 @@ export class OrderbookEngine {
           ageRec.traded = 0;
         }
 
-        // Preserve existing status within TTL instead of resetting to 'active' on every 100ms depth update
+        // Preserve existing status within TTL instead of resetting to 'active' on every update
         let status: 'active' | 'defended' | 'consumed' | 'pulled' = 'active';
         if (ageRec.status === 'defended') {
           if (ageRec.statusExpireTs && now < ageRec.statusExpireTs) {
@@ -1134,7 +1371,7 @@ export class OrderbookEngine {
           label: '',
         };
 
-        // Evaluate whether this wall just completed a defense bounce or was breached on this depth update
+        // Evaluate whether this wall just completed a defense bounce or was breached
         this.evaluateWallState(wallRecord, ageRec, now);
 
         const ageMs = now - ageRec.born;
@@ -1149,6 +1386,18 @@ export class OrderbookEngine {
         }
 
         detected.push(wallRecord);
+      }
+    }
+
+    // Prune stale non-candidate entries from wallAges so the map stays compact
+    for (const [wKey, wRec] of this.wallAges.entries()) {
+      if (
+        !activeCandidateKeys.has(wKey) &&
+        wRec.status !== 'defended' &&
+        wRec.status !== 'consumed' &&
+        now - wRec.lastSeenTs > 15000
+      ) {
+        this.wallAges.delete(wKey);
       }
     }
 
@@ -1179,6 +1428,10 @@ export class OrderbookEngine {
       : false;
 
     if (breachedByBook || breachedByTrade) {
+      if (rec.status === 'consumed' && rec.statusExpireTs && now < rec.statusExpireTs) {
+        wall.status = 'consumed';
+        return;
+      }
       const priorTraded = rec.traded || 0;
       rec.status = 'consumed';
       rec.statusExpireTs = now + 8000;
@@ -1189,23 +1442,34 @@ export class OrderbookEngine {
       wall.touchCount = 0;
       wall.tradedNotional = 0;
 
+      const wallSide: 'B' | 'A' = isBid ? 'B' : 'A';
+      const alreadySweptLevel = this.sweptWallLevels.some(
+        (sw) => sw.side === wallSide && Math.abs(sw.price - wall.price) <= tolerance && now - sw.ts < 10000
+      );
+      if (!alreadySweptLevel) {
+        this.sweptWallLevels.push({
+          price: wall.price,
+          side: wallSide,
+          notional: Math.max(wall.notional, rec.peak || 0),
+          ts: now,
+          expireTs: now + 8000,
+        });
+        if (this.sweptWallLevels.length > 20) this.sweptWallLevels.shift();
+      }
+
       if (trade) {
         const minSweepNotional = Math.max(2000, Math.round(this.effectiveWhaleMinUsdt * 0.25));
         const sweptNotional = Math.max(priorTraded, trade.notional);
         if (sweptNotional >= minSweepNotional) {
-          const lastSweep = this.events.find((e) => e.type === 'DOM SWEEP' && now - e.ts < 10000);
-          if (!lastSweep) {
-            this.addEvent({
-              id: `sweep-${now}-${trade.price}`,
-              type: 'DOM SWEEP',
-              severity: sweptNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
-              text: `⚡ DOM SWEEP: ${isBid ? 'BİD' : 'ASK'} Duvarı Süpürüldü @ ${wall.price} ($${this.formatCompact(sweptNotional)})`,
-              side: trade.side,
-              price: trade.price,
-              ts: now,
-            });
-          }
-          this.generateVacuumSweepOpportunity(isBid ? 'B' : 'A', wall.price, sweptNotional, trade.notional);
+          this.recordDomSweepEvent(
+            now,
+            trade.side,
+            wall.price,
+            tolerance,
+            sweptNotional >= this.effectiveWhaleMinUsdt ? 'high' : 'medium',
+            `⚡ DOM SWEEP: ${isBid ? 'BİD' : 'ASK'} Duvarı Süpürüldü @ ${wall.price} ($${this.formatCompact(sweptNotional)})`
+          );
+          this.generateVacuumSweepOpportunity(wallSide, wall.price, sweptNotional, trade.notional);
         }
       }
       return;
@@ -1476,9 +1740,11 @@ export class OrderbookEngine {
   }
 
   // Distance-Weighted Order Book Imbalance (OBI) Snapshot Calculation:
-  // Weights decay hyperbolically with percentage distance from the mid price: w_i = 1 / (1 + dist_ratio)
-  private recordDistanceWeightedObi() {
+  // Throttled to 250ms unless force=true
+  private recordDistanceWeightedObi(force = false) {
     const now = Date.now();
+    if (!force && now - this.lastObiSampleTs < 250) return;
+    this.lastObiSampleTs = now;
     const mid = this.midPrice;
     if (!mid) return;
 
@@ -1571,7 +1837,7 @@ export class OrderbookEngine {
   // plus real L2 half-spread cost (since entry is mid and LONG exits at Bid, SHORT exits at Ask).
   private getExecutionCostProfile(refPrice?: number) {
     const mid = this.midPrice || refPrice || 0;
-    const bookValid = this.depthReady && this.bestBid > 0 && this.bestAsk > this.bestBid;
+    const bookValid = this.isOrderbookSynced();
     const spreadPrice = bookValid
       ? this.bestAsk - this.bestBid
       : Math.max(this.tickSize, mid * 0.0002);
@@ -1599,6 +1865,278 @@ export class OrderbookEngine {
       totalCostBps,
       totalCostPct,
       totalCostPrice,
+    };
+  }
+
+  // Unified Multi-Window CVD + Distance-Weighted OBI Flow Factor in [0, 1]
+  // 0.50 = strictly neutral; < 0.50 = flow opposes signal bias; > 0.50 = flow aligns with signal bias
+  private computeUnifiedFlowFactor(
+    bias: 'LONG' | 'SHORT',
+    cvd: MultiCVDState,
+    obi: MultiOBIState
+  ): number {
+    let score = 0.50;
+
+    // 1. Multi-Window CVD Alignment ([-0.30, +0.30])
+    const cvdAligned =
+      (bias === 'LONG' && cvd.direction === 'BULL') ||
+      (bias === 'SHORT' && cvd.direction === 'BEAR');
+    const cvdOpposed =
+      (bias === 'LONG' && cvd.direction === 'BEAR') ||
+      (bias === 'SHORT' && cvd.direction === 'BULL');
+
+    if (cvdAligned) {
+      score += 0.16;
+      if (cvd.accelerating) score += 0.08;
+      if (cvd.allAligned) score += 0.06;
+    } else if (cvdOpposed) {
+      score -= 0.20;
+      if (cvd.accelerating) score -= 0.06;
+      if (cvd.allAligned) score -= 0.04;
+    }
+
+    // 2. Multi-Window OBI Alignment ([-0.20, +0.20])
+    const obiAligned =
+      (bias === 'LONG' && obi.aligned === 'BULL') ||
+      (bias === 'SHORT' && obi.aligned === 'BEAR');
+    const obiOpposed =
+      (bias === 'LONG' && obi.aligned === 'BEAR') ||
+      (bias === 'SHORT' && obi.aligned === 'BULL');
+    const obiStrengthBoost = Math.min(0.06, (Math.abs(obi.strength) / 100) * 0.08);
+
+    if (obiAligned) {
+      score += 0.14 + obiStrengthBoost;
+    } else if (obiOpposed) {
+      score -= 0.16 + Math.min(0.04, obiStrengthBoost);
+    } else {
+      // MIXED OBI: check short-term trend
+      if (
+        (bias === 'LONG' && obi.trend === 'RISING') ||
+        (bias === 'SHORT' && obi.trend === 'FALLING')
+      ) {
+        score += 0.03;
+      } else if (
+        (bias === 'LONG' && obi.trend === 'FALLING') ||
+        (bias === 'SHORT' && obi.trend === 'RISING')
+      ) {
+        score -= 0.03;
+      }
+    }
+
+    return Math.min(1, Math.max(0, +score.toFixed(3)));
+  }
+
+  // Unified Payoff & Execution Cost Efficiency Factor in [0, 1]
+  // Evaluates net R:R (after 10 bps taker fee + half-spread), stop-to-cost buffer ratio, and structural target anchoring
+  private computeUnifiedPayoffFactor(
+    netRrRatio: number,
+    actualRiskBps: number,
+    totalCostBps: number,
+    usedStructural: boolean
+  ): number {
+    const rrNorm = Math.min(1, Math.max(0, (netRrRatio - 1.1) / 1.4));
+    const costMultiple = actualRiskBps / Math.max(1, totalCostBps);
+    const costNorm = Math.min(1, Math.max(0, (costMultiple - 2.5) / 3.5));
+    const structBonus = usedStructural ? 0.16 : 0;
+    return Math.min(1, Math.max(0, +(rrNorm * 0.58 + costNorm * 0.26 + structBonus).toFixed(3)));
+  }
+
+  // Reconstructs normalized [0..1] microstructure factors for legacy cards stored in localStorage prior to factor logging
+  private inferLegacyCardFactors(card: OpportunityCard): ConfidenceFactors {
+    const reasonsText = (card.reasons || []).join(' | ');
+    const bias = card.bias;
+
+    // Infer flow factor from logged CVD and OBI states in card.reasons
+    let flow = 0.50;
+    const cvdMatch = reasonsText.match(/CVD\s+(BULL|BEAR|FLAT)/i);
+    const obiMatch = reasonsText.match(/OBI\s+(BULL|BEAR|MIXED)/i);
+    if (cvdMatch) {
+      const dir = cvdMatch[1].toUpperCase();
+      if ((bias === 'LONG' && dir === 'BULL') || (bias === 'SHORT' && dir === 'BEAR')) flow += 0.22;
+      else if ((bias === 'LONG' && dir === 'BEAR') || (bias === 'SHORT' && dir === 'BULL')) flow -= 0.22;
+    }
+    if (obiMatch) {
+      const al = obiMatch[1].toUpperCase();
+      if ((bias === 'LONG' && al === 'BULL') || (bias === 'SHORT' && al === 'BEAR')) flow += 0.16;
+      else if ((bias === 'LONG' && al === 'BEAR') || (bias === 'SHORT' && al === 'BULL')) flow -= 0.16;
+    }
+    flow = Math.min(1, Math.max(0, +flow.toFixed(3)));
+
+    const netRr = card.netRrRatio ?? Math.max(1.1, (card.rrRatio || 1.8) - 0.35);
+    const payoff = Math.min(1, Math.max(0.15, +(((netRr - 1.1) / 1.4) * 0.75 + 0.15).toFixed(3)));
+
+    // Remove legacy generator-specific constant inflation (+20 on DELTA_DIVERGENCE, +15 on VACUUM_SWEEP)
+    const raw = card.rawConfidenceScore ?? card.confidenceScore ?? 65;
+    const debias =
+      card.type === 'DELTA_DIVERGENCE'
+        ? raw - 12
+        : card.type === 'VACUUM_SWEEP'
+        ? raw - 6
+        : card.type === 'ICEBERG_ABSORPTION'
+        ? raw + 6
+        : raw;
+    const baseNorm = Math.min(0.95, Math.max(0.25, (debias - 35) / 60));
+
+    return {
+      structure: +Math.min(1, Math.max(0.2, baseNorm)).toFixed(3),
+      execution: +Math.min(1, Math.max(0.2, baseNorm * 0.95)).toFixed(3),
+      flow,
+      payoff,
+    };
+  }
+
+  // Empirical Factor Weight Calibration:
+  // Combines microstructure prior weights w0 = (0.28, 0.30, 0.27, 0.15) with online empirical covariance
+  // between each factor f_k and realized net R-multiple across resolved trades (HIT_TARGET, STOPPED, EXPIRED).
+  public getCalibratedFactorWeights(excludeId?: string): {
+    structure: number;
+    execution: number;
+    flow: number;
+    payoff: number;
+    isEmpirical: boolean;
+    sampleSize: number;
+  } {
+    const prior = { structure: 0.28, execution: 0.30, flow: 0.27, payoff: 0.15 };
+    const resolved = (this.opportunities || []).filter(
+      (o) =>
+        o &&
+        o.id !== excludeId &&
+        (o.status === 'HIT_TARGET' || o.status === 'STOPPED' || o.status === 'EXPIRED')
+    );
+
+    const n = resolved.length;
+    if (n < 4) {
+      return { ...prior, isEmpirical: false, sampleSize: n };
+    }
+
+    const samples = resolved.map((o) => {
+      const f = o.factors ?? this.inferLegacyCardFactors(o);
+      const feePct = o.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT;
+      const halfSpreadPct = ((o.spreadBps ?? 2.0) / 2) / 100;
+      const grossStopPct =
+        o.riskPct && o.riskPct > 0
+          ? o.riskPct
+          : Math.max(0.25, (Math.abs(o.entryPrice - o.stopPrice) / Math.max(1e-9, o.entryPrice)) * 100);
+      const netStopPct = Math.max(0.15, grossStopPct + feePct + halfSpreadPct);
+      const netPnlPct = o.pnlPct ?? -(feePct + halfSpreadPct);
+      const rMult = Math.max(-1.5, Math.min(2.5, netPnlPct / netStopPct));
+      const winTarget = (netPnlPct > 0 ? 0.5 : -0.5) + 0.5 * (rMult / 2.0);
+      return { f, y: winTarget };
+    });
+
+    const meanY = samples.reduce((acc, s) => acc + s.y, 0) / n;
+    const keys: (keyof ConfidenceFactors)[] = ['structure', 'execution', 'flow', 'payoff'];
+    const rawWeights: Record<keyof ConfidenceFactors, number> = { ...prior };
+    const shrinkage = n / (n + 10); // Bayesian shrinkage factor in (0, 1)
+
+    for (const k of keys) {
+      const meanF = samples.reduce((acc, s) => acc + s.f[k], 0) / n;
+      let cov = 0;
+      let varF = 0;
+      for (const s of samples) {
+        const df = s.f[k] - meanF;
+        cov += df * (s.y - meanY);
+        varF += df * df;
+      }
+      cov /= n;
+      const stdF = Math.sqrt(varF / n);
+      const slope = stdF > 0.02 ? cov / stdF : 0;
+      // Exponentially tilt prior weight toward empirically predictive factors, clamped to [0.12, 0.44]
+      rawWeights[k] = Math.min(0.44, Math.max(0.12, prior[k] * Math.exp(1.35 * shrinkage * slope)));
+    }
+
+    const sumW = rawWeights.structure + rawWeights.execution + rawWeights.flow + rawWeights.payoff;
+    const structure = +(rawWeights.structure / sumW).toFixed(3);
+    const execution = +(rawWeights.execution / sumW).toFixed(3);
+    const flow = +(rawWeights.flow / sumW).toFixed(3);
+    const payoff = +(1 - structure - execution - flow).toFixed(3);
+
+    return {
+      structure,
+      execution,
+      flow,
+      payoff,
+      isEmpirical: true,
+      sampleSize: n,
+    };
+  }
+
+  // Unified & Empirically Calibrated Confidence Calculator:
+  // Eliminates per-generator constant inflation, enforces strict multi-factor confluence gates for HIGH (≥78),
+  // and applies Bayesian posterior shrinkage based on live resolved outcomes.
+  private computeCalibratedConfidence(
+    type: OpportunityCard['type'],
+    factors: ConfidenceFactors,
+    excludeId?: string
+  ): {
+    rawConfidenceScore: number;
+    confidenceScore: number;
+    confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+  } {
+    const weights = this.getCalibratedFactorWeights(excludeId);
+
+    const composite =
+      weights.structure * factors.structure +
+      weights.execution * factors.execution +
+      weights.flow * factors.flow +
+      weights.payoff * factors.payoff;
+
+    // Standardized linear mapping onto [36, 95] without any generator-specific bias
+    const rawConfidenceScore = Math.round(Math.min(95, Math.max(36, 35 + composite * 60)));
+
+    // Empirical Signal-Type Bayesian Posterior adjustment from resolved outcomes of the same setup type
+    const sameTypeResolved = (this.opportunities || []).filter(
+      (o) =>
+        o &&
+        o.id !== excludeId &&
+        o.type === type &&
+        (o.status === 'HIT_TARGET' || o.status === 'STOPPED' || o.status === 'EXPIRED')
+    );
+
+    let typeAdj = 0;
+    if (sameTypeResolved.length >= 2) {
+      let sumR = 0;
+      let wins = 0;
+      for (const o of sameTypeResolved) {
+        const feePct = o.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT;
+        const halfSpreadPct = ((o.spreadBps ?? 2.0) / 2) / 100;
+        const grossStopPct =
+          o.riskPct && o.riskPct > 0
+            ? o.riskPct
+            : Math.max(0.25, (Math.abs(o.entryPrice - o.stopPrice) / Math.max(1e-9, o.entryPrice)) * 100);
+        const netStopPct = Math.max(0.15, grossStopPct + feePct + halfSpreadPct);
+        const netPnl = o.pnlPct ?? -(feePct + halfSpreadPct);
+        if (netPnl > 0) wins++;
+        sumR += netPnl / netStopPct;
+      }
+      const nType = sameTypeResolved.length;
+      const avgR = sumR / nType;
+      const winRate = wins / nType;
+      const typeShrinkage = nType / (nType + 8);
+      typeAdj = Math.round(
+        Math.max(-6, Math.min(6, typeShrinkage * (avgR * 7 + (winRate - 0.50) * 12)))
+      );
+    }
+
+    let score = Math.min(95, Math.max(36, rawConfidenceScore + typeAdj));
+
+    // Strict Microstructure Confluence Gates:
+    // 1. If CVD + OBI order flow actively opposes the signal bias (flow < 0.45), cap at LOW (≤56).
+    // 2. To qualify for HIGH (≥78), the signal MUST have positive flow alignment (flow >= 0.58)
+    //    AND verified execution/absorption (execution >= 0.48) AND solid structure (structure >= 0.45).
+    if (factors.flow < 0.45) {
+      score = Math.min(score, 56);
+    } else if (factors.flow < 0.58 || factors.execution < 0.48 || factors.structure < 0.45) {
+      score = Math.min(score, 76);
+    }
+
+    const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
+      score >= 78 ? 'HIGH' : score >= 58 ? 'MEDIUM' : 'LOW';
+
+    return {
+      rawConfidenceScore,
+      confidenceScore: score,
+      confidence,
     };
   }
 
@@ -1718,36 +2256,34 @@ export class OrderbookEngine {
     // Require positive expectancy after deducting round-trip taker fee + half-spread
     if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
-    // 5. Scientific Multi-Variable Dynamic Confidence Calculation (0 - 100)
-    const retentionScore = Math.round(Math.min(1.0, retentionPct / 100) * 16);
-    const sizeBonus = Math.min(14, (currentNotional / Math.max(1, this.whaleMinUsdt)) * 12);
-    const depthFactor = retentionScore + Math.round(sizeBonus);
+    // 5. Standardized [0..1] Microstructure Factors & Empirically Calibrated Confidence
+    const notionalNorm = Math.min(1, currentNotional / Math.max(1, this.effectiveWhaleMinUsdt * 1.4));
+    const retentionNorm = Math.min(1, Math.max(0, (retentionPct - 35) / 65));
+    const fStructure = +Math.min(1, Math.max(0.15, notionalNorm * 0.55 + retentionNorm * 0.45)).toFixed(3);
 
-    const touchScore =
-      recentTouchCount === 2 ? 8 : recentTouchCount === 3 ? 13 : Math.min(18, 13 + (recentTouchCount - 3) * 2.5);
-    const bounceScore = Math.min(12, Math.max(2, Math.round((bounceBps / 3) * 3)));
-    const testFactor = Math.round(touchScore + bounceScore);
+    const touchNorm = Math.min(1, (recentTouchCount - 1) / 3.5);
+    const absorbedNorm = Math.min(1, recentTraded / Math.max(1, this.effectiveWallMinTraded * 2.5));
+    const bounceNorm = Math.min(1, bounceBps / 10);
+    const fExecution = +Math.min(1, Math.max(0.15, touchNorm * 0.35 + absorbedNorm * 0.40 + bounceNorm * 0.25)).toFixed(3);
 
-    let flowScore = 0;
-    if (bias === 'LONG') {
-      if (cvd.direction === 'BULL') flowScore += cvd.accelerating ? 15 : 10;
-      else if (cvd.direction === 'BEAR') flowScore -= 14;
-      if (obi.aligned === 'BULL') flowScore += 10;
-      else if (obi.aligned === 'MIXED') flowScore += 2;
-      else if (obi.aligned === 'BEAR') flowScore -= 10;
-    } else {
-      if (cvd.direction === 'BEAR') flowScore += cvd.accelerating ? 15 : 10;
-      else if (cvd.direction === 'BULL') flowScore -= 14;
-      if (obi.aligned === 'BEAR') flowScore += 10;
-      else if (obi.aligned === 'MIXED') flowScore += 2;
-      else if (obi.aligned === 'BULL') flowScore -= 10;
-    }
+    const fFlow = this.computeUnifiedFlowFactor(bias, cvd, obi);
+    const fPayoff = this.computeUnifiedPayoffFactor(
+      netRrRatio,
+      actualRiskBps,
+      costProfile.totalCostBps,
+      structuralTarget !== null
+    );
 
-    const rrScore = Math.min(15, Math.max(0, Math.round((netRrRatio - 1.0) * 12)));
-    const rawScore = depthFactor + testFactor + flowScore + rrScore;
-    const confidenceScore = Math.min(96, Math.max(42, Math.round(rawScore)));
-    const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
-      confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
+    const factors: ConfidenceFactors = {
+      structure: fStructure,
+      execution: fExecution,
+      flow: fFlow,
+      payoff: fPayoff,
+    };
+    const { rawConfidenceScore, confidenceScore, confidence } = this.computeCalibratedConfidence(
+      'DEFENDED_WALL',
+      factors
+    );
 
     const riskPct = +grossRiskPct.toFixed(2);
 
@@ -1770,11 +2306,13 @@ export class OrderbookEngine {
       grossPnlPct: 0,
       confidence,
       confidenceScore,
+      rawConfidenceScore,
+      factors,
       reasons: [
         `Anlık Giriş: ${entryPrice} (Duvar: ${wall.price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
         `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
         `Duvar Doluluk & Emilim: %${retentionPct.toFixed(0)} korundu ($${this.formatCompact(currentNotional)}), 30s'de ${recentTouchCount}× temas ($${this.formatCompact(recentTraded)} emildi).`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Kalibre Faktörler: Yapı %${Math.round(fStructure * 100)} · İcra %${Math.round(fExecution * 100)} · Akış %${Math.round(fFlow * 100)} (CVD ${cvd.direction}/OBI ${obi.aligned}) · Getiri %${Math.round(fPayoff * 100)} → Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
@@ -1788,7 +2326,7 @@ export class OrderbookEngine {
     };
 
     this.opportunities.unshift(card);
-    if (this.opportunities.length > 60) this.opportunities.pop();
+    if (this.opportunities.length > 150) this.opportunities.pop();
     this.saveOpportunities();
     if (this.onOpportunityCreated) this.onOpportunityCreated(card);
   }
@@ -1899,17 +2437,33 @@ export class OrderbookEngine {
 
     if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
-    const sweepVolumeRatio = Math.min(30, Math.round((executedNotional / Math.max(1, sweptNotional)) * 25));
-    const sizeScore = Math.min(25, Math.round((sweptNotional / this.effectiveWhaleMinUsdt) * 15));
-    let flowScore = 15;
-    if (bias === 'SHORT' && cvd.direction === 'BEAR') flowScore += 15;
-    else if (bias === 'LONG' && cvd.direction === 'BULL') flowScore += 15;
-    const rrScore = Math.min(15, Math.round((netRrRatio - 1.0) * 12));
+    // Standardized [0..1] Microstructure Factors & Empirically Calibrated Confidence
+    const sweptSizeNorm = Math.min(1, sweptNotional / Math.max(1, this.effectiveWhaleMinUsdt * 1.3));
+    const clearanceNorm = structuralTarget !== null ? 0.85 : 0.55;
+    const fStructure = +Math.min(1, Math.max(0.15, sweptSizeNorm * 0.70 + clearanceNorm * 0.30)).toFixed(3);
 
-    const rawScore = sweepVolumeRatio + sizeScore + flowScore + rrScore;
-    const confidenceScore = Math.min(95, Math.max(45, rawScore));
-    const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
-      confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
+    const execRatioNorm = Math.min(1, (executedNotional / Math.max(1, sweptNotional)) * 0.82);
+    const burstNorm = Math.min(1, executedNotional / Math.max(1, this.effectiveWhaleMinUsdt));
+    const fExecution = +Math.min(1, Math.max(0.15, execRatioNorm * 0.65 + burstNorm * 0.35)).toFixed(3);
+
+    const fFlow = this.computeUnifiedFlowFactor(bias, cvd, obi);
+    const fPayoff = this.computeUnifiedPayoffFactor(
+      netRrRatio,
+      actualRiskBps,
+      costProfile.totalCostBps,
+      structuralTarget !== null
+    );
+
+    const factors: ConfidenceFactors = {
+      structure: fStructure,
+      execution: fExecution,
+      flow: fFlow,
+      payoff: fPayoff,
+    };
+    const { rawConfidenceScore, confidenceScore, confidence } = this.computeCalibratedConfidence(
+      'VACUUM_SWEEP',
+      factors
+    );
 
     const riskPct = +grossRiskPct.toFixed(2);
 
@@ -1930,11 +2484,13 @@ export class OrderbookEngine {
       grossPnlPct: 0,
       confidence,
       confidenceScore,
+      rawConfidenceScore,
+      factors,
       reasons: [
         `Likidite Süpürüldü: ${side === 'B' ? 'Destek' : 'Direnç'} duvarı ($${this.formatCompact(sweptNotional)}) piyasa emirleriyle temizlendi ($${this.formatCompact(executedNotional)} hacim emildi).`,
         `Anlık Giriş: ${entryPrice} (Kırılan: ${price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
         `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Kalibre Faktörler: Yapı %${Math.round(fStructure * 100)} · İcra %${Math.round(fExecution * 100)} · Akış %${Math.round(fFlow * 100)} (CVD ${cvd.direction}/OBI ${obi.aligned}) · Getiri %${Math.round(fPayoff * 100)} → Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
@@ -1948,7 +2504,7 @@ export class OrderbookEngine {
     };
 
     this.opportunities.unshift(card);
-    if (this.opportunities.length > 60) this.opportunities.pop();
+    if (this.opportunities.length > 150) this.opportunities.pop();
     this.saveOpportunities();
     if (this.onOpportunityCreated) this.onOpportunityCreated(card);
   }
@@ -2056,28 +2612,34 @@ export class OrderbookEngine {
 
     if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
+    // Standardized [0..1] Microstructure Factors & Empirically Calibrated Confidence
     const replenishRatio = tracker.replenishedNotional / Math.max(this.effectiveIcebergDisplayedFloor, tracker.peakNotional);
-    const replenishScore = Math.min(25, Math.round(replenishRatio * 14));
-    const refillScore = Math.min(20, tracker.refillCount * 6);
+    const replRatioNorm = Math.min(1, replenishRatio / 2.2);
+    const replSizeNorm = Math.min(1, tracker.replenishedNotional / Math.max(1, this.effectiveIcebergMinReplenish * 2.5));
+    const fStructure = +Math.min(1, Math.max(0.15, replRatioNorm * 0.50 + replSizeNorm * 0.50)).toFixed(3);
 
-    let flowScore = 0;
-    if (bias === 'LONG') {
-      if (cvd.direction === 'BULL') flowScore += cvd.accelerating ? 15 : 10;
-      else if (cvd.direction === 'BEAR') flowScore -= 12;
-      if (obi.aligned === 'BULL') flowScore += 10;
-      else if (obi.aligned === 'BEAR') flowScore -= 10;
-    } else {
-      if (cvd.direction === 'BEAR') flowScore += cvd.accelerating ? 15 : 10;
-      else if (cvd.direction === 'BULL') flowScore -= 12;
-      if (obi.aligned === 'BEAR') flowScore += 10;
-      else if (obi.aligned === 'BULL') flowScore -= 10;
-    }
+    const refillNorm = Math.min(1, (tracker.refillCount - 1) / 3.5);
+    const absorbedNorm = Math.min(1, tracker.tradedNotional / Math.max(1, this.effectiveIcebergMinTraded * 2.5));
+    const fExecution = +Math.min(1, Math.max(0.15, refillNorm * 0.45 + absorbedNorm * 0.55)).toFixed(3);
 
-    const rrScore = Math.min(15, Math.max(0, Math.round((netRrRatio - 1.0) * 12)));
-    const rawScore = replenishScore + refillScore + flowScore + rrScore;
-    const confidenceScore = Math.min(96, Math.max(42, Math.round(rawScore)));
-    const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
-      confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
+    const fFlow = this.computeUnifiedFlowFactor(bias, cvd, obi);
+    const fPayoff = this.computeUnifiedPayoffFactor(
+      netRrRatio,
+      actualRiskBps,
+      costProfile.totalCostBps,
+      usedStructural
+    );
+
+    const factors: ConfidenceFactors = {
+      structure: fStructure,
+      execution: fExecution,
+      flow: fFlow,
+      payoff: fPayoff,
+    };
+    const { rawConfidenceScore, confidenceScore, confidence } = this.computeCalibratedConfidence(
+      'ICEBERG_ABSORPTION',
+      factors
+    );
 
     const riskPct = +grossRiskPct.toFixed(2);
 
@@ -2100,11 +2662,13 @@ export class OrderbookEngine {
       grossPnlPct: 0,
       confidence,
       confidenceScore,
+      rawConfidenceScore,
+      factors,
       reasons: [
         `Anlık Giriş: ${entryPrice} (Emilim: ${price}) · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
         `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
         `Gerçek Likidite Yenilemesi: Tahtaya +$${this.formatCompact(tracker.replenishedNotional)} yeni limit emir eklendi (${tracker.refillCount}× yenilenme, $${this.formatCompact(tracker.tradedNotional)} karşılandı).`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Kalibre Faktörler: Yapı %${Math.round(fStructure * 100)} · İcra %${Math.round(fExecution * 100)} · Akış %${Math.round(fFlow * 100)} (CVD ${cvd.direction}/OBI ${obi.aligned}) · Getiri %${Math.round(fPayoff * 100)} → Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
@@ -2118,7 +2682,7 @@ export class OrderbookEngine {
     };
 
     this.opportunities.unshift(card);
-    if (this.opportunities.length > 60) this.opportunities.pop();
+    if (this.opportunities.length > 150) this.opportunities.pop();
     this.saveOpportunities();
     if (this.onOpportunityCreated) this.onOpportunityCreated(card);
   }
@@ -2210,13 +2774,39 @@ export class OrderbookEngine {
 
     if (rrRatio < 1.75 || netRrRatio < 1.1 || netRewardPct <= costProfile.totalCostPct) return;
 
-    const divStrengthScore = Math.min(30, Math.round((Math.abs(cvdNotional) / Math.max(1, this.effectiveCvdThreshold)) * 18));
-    const obiScore = bias === 'LONG' && obi.aligned === 'BULL' ? 20 : bias === 'SHORT' && obi.aligned === 'BEAR' ? 20 : 10;
-    const rrScore = Math.min(20, Math.round((netRrRatio - 1.0) * 12));
+    // Standardized [0..1] Microstructure Factors & Empirically Calibrated Confidence (no free +20 offset)
+    const divRatio = Math.abs(cvdNotional) / Math.max(1, this.effectiveCvdThreshold);
+    const fStructure = +Math.min(1, Math.max(0.18, (divRatio - 1.0) / 3.0)).toFixed(3);
 
-    const confidenceScore = Math.min(96, Math.max(50, divStrengthScore + obiScore + rrScore + 20));
-    const confidence: 'HIGH' | 'MEDIUM' | 'LOW' =
-      confidenceScore >= 78 ? 'HIGH' : confidenceScore >= 58 ? 'MEDIUM' : 'LOW';
+    const s10Aligned = (bias === 'LONG' && cvd.s10 > 0) || (bias === 'SHORT' && cvd.s10 < 0);
+    const s30Aligned = (bias === 'LONG' && cvd.s30 > 0) || (bias === 'SHORT' && cvd.s30 < 0);
+    const s10Mag = Math.min(1, Math.abs(cvd.s10) / Math.max(1, this.effectiveCvdThreshold * 0.45));
+    const fExecution = +Math.min(
+      1,
+      Math.max(
+        0.15,
+        (s10Aligned ? 0.45 : 0.12) + (s30Aligned ? 0.30 : 0.08) + (s10Aligned ? s10Mag * 0.25 : 0)
+      )
+    ).toFixed(3);
+
+    const fFlow = this.computeUnifiedFlowFactor(bias, cvd, obi);
+    const fPayoff = this.computeUnifiedPayoffFactor(
+      netRrRatio,
+      actualRiskBps,
+      costProfile.totalCostBps,
+      usedStructural
+    );
+
+    const factors: ConfidenceFactors = {
+      structure: fStructure,
+      execution: fExecution,
+      flow: fFlow,
+      payoff: fPayoff,
+    };
+    const { rawConfidenceScore, confidenceScore, confidence } = this.computeCalibratedConfidence(
+      'DELTA_DIVERGENCE',
+      factors
+    );
 
     const riskPct = +grossRiskPct.toFixed(2);
 
@@ -2237,11 +2827,13 @@ export class OrderbookEngine {
       grossPnlPct: 0,
       confidence,
       confidenceScore,
+      rawConfidenceScore,
+      factors,
       reasons: [
         `Net Akış Uyumsuzluğu: Fiyat %${priceDeltaPct.toFixed(2)} hareket ederken 60s CVD $${this.formatCompact(cvdNotional)} baskı üretti.`,
         `Anlık Giriş: ${entryPrice} · Stop: ${stopPrice} (${actualRiskBps.toFixed(0)} bps) · Hedef: ${targetPrice}.`,
         `Net Kârlılık Modeli: Komisyon %${costProfile.feePct.toFixed(2)} (10 bps) + ½Spread ${costProfile.halfSpreadBps.toFixed(1)} bps · Net Hedef +${netRewardPct}% / Net Stop -${netRiskPct}% (Net R:R 1:${netRrRatio}).`,
-        `Piyasa Akışı: CVD ${cvd.direction} | OBI ${obi.aligned} | Brüt R:R 1:${rrRatio} | Güven: %${confidenceScore} (${confidence})`,
+        `Kalibre Faktörler: Yapı %${Math.round(fStructure * 100)} · İcra %${Math.round(fExecution * 100)} · Akış %${Math.round(fFlow * 100)} (CVD ${cvd.direction}/OBI ${obi.aligned}) · Getiri %${Math.round(fPayoff * 100)} → Güven: %${confidenceScore} (${confidence})`,
       ],
       timestamp: now,
       status: 'ACTIVE',
@@ -2255,7 +2847,7 @@ export class OrderbookEngine {
     };
 
     this.opportunities.unshift(card);
-    if (this.opportunities.length > 60) this.opportunities.pop();
+    if (this.opportunities.length > 150) this.opportunities.pop();
     this.saveOpportunities();
     if (this.onOpportunityCreated) this.onOpportunityCreated(card);
   }
@@ -2273,7 +2865,8 @@ export class OrderbookEngine {
     now = Date.now(),
     klineCandle?: { openTimeMs: number; high: number; low: number }
   ) {
-    if (!currentPrice || !this.opportunities.length) return;
+    // Strictly pause lifecycle evaluation when orderbook snapshot or sequence stream is not synchronized
+    if (!this.isOrderbookSynced() || !currentPrice || !this.opportunities.length) return;
 
     let anyResolved = false;
     const liveCost = this.getExecutionCostProfile(currentPrice);
@@ -2294,16 +2887,13 @@ export class OrderbookEngine {
       const halfSpreadPct = (spreadBps / 2) / 100;
       const totalCostPct = feePct + halfSpreadPct;
 
-      // If card belongs to a different symbol than currently active book, expire it if past lifespan
+      // If card belongs to a different symbol than currently active book, mark it CANCELLED (user switched symbol) so it does not pollute stats
       if (card.symbol !== this.symbol) {
-        if (durationSec >= maxDur) {
-          card.status = 'EXPIRED';
-          card.exitPrice = card.currentPrice || card.entryPrice;
-          card.resolvedAt = now;
-          card.pnlPct = card.pnlPct ?? -+totalCostPct.toFixed(2);
-          anyResolved = true;
-          if (this.onOpportunityUpdated) this.onOpportunityUpdated(card);
-        }
+        card.status = 'CANCELLED';
+        card.exitPrice = card.currentPrice || card.entryPrice;
+        card.resolvedAt = now;
+        anyResolved = true;
+        if (this.onOpportunityUpdated) this.onOpportunityUpdated(card);
         continue;
       }
 
@@ -2361,20 +2951,9 @@ export class OrderbookEngine {
           card.progressPct = Math.max(-100, -Math.round(((card.entryPrice - execBid) / stopDist) * 100));
         }
 
-        // Target reached: Executable Bid price rose to or above targetPrice
-        if (checkHigh >= card.targetPrice) {
-          const fillPrice = +Math.max(card.targetPrice, execBid).toFixed(this.precision);
-          const grossPnl = ((fillPrice - card.entryPrice) / card.entryPrice) * 100;
-          card.status = 'HIT_TARGET';
-          card.exitPrice = fillPrice;
-          card.currentPrice = fillPrice;
-          card.resolvedAt = now;
-          card.durationSec = Math.max(1, durationSec);
-          card.progressPct = 100;
-          card.grossPnlPct = +grossPnl.toFixed(2);
-          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
-          resolved = true;
-        } else if (checkLow <= card.stopPrice) {
+        // Conservative Priority Rule: If both Stop and Target are touched within the same tick/candle update,
+        // ALWAYS evaluate STOP LOSS FIRST to prevent optimistic look-ahead bias.
+        if (checkLow <= card.stopPrice) {
           // Stopped: Executable Bid price fell to or below stopPrice
           const fillPrice = +Math.min(card.stopPrice, execBid).toFixed(this.precision);
           const grossPnl = ((fillPrice - card.entryPrice) / card.entryPrice) * 100;
@@ -2384,6 +2963,19 @@ export class OrderbookEngine {
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = -100;
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
+          resolved = true;
+        } else if (checkHigh >= card.targetPrice) {
+          // Target reached: Executable Bid price rose to or above targetPrice without breaching stopPrice
+          const fillPrice = +Math.max(card.targetPrice, execBid).toFixed(this.precision);
+          const grossPnl = ((fillPrice - card.entryPrice) / card.entryPrice) * 100;
+          card.status = 'HIT_TARGET';
+          card.exitPrice = fillPrice;
+          card.currentPrice = fillPrice;
+          card.resolvedAt = now;
+          card.durationSec = Math.max(1, durationSec);
+          card.progressPct = 100;
           card.grossPnlPct = +grossPnl.toFixed(2);
           card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
@@ -2425,20 +3017,8 @@ export class OrderbookEngine {
           card.progressPct = Math.max(-100, -Math.round(((execAsk - card.entryPrice) / stopDist) * 100));
         }
 
-        // Target reached: Executable Ask price fell to or below targetPrice
-        if (checkLow <= card.targetPrice) {
-          const fillPrice = +Math.min(card.targetPrice, execAsk).toFixed(this.precision);
-          const grossPnl = ((card.entryPrice - fillPrice) / card.entryPrice) * 100;
-          card.status = 'HIT_TARGET';
-          card.exitPrice = fillPrice;
-          card.currentPrice = fillPrice;
-          card.resolvedAt = now;
-          card.durationSec = Math.max(1, durationSec);
-          card.progressPct = 100;
-          card.grossPnlPct = +grossPnl.toFixed(2);
-          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
-          resolved = true;
-        } else if (checkHigh >= card.stopPrice) {
+        // Conservative Priority Rule: Always evaluate STOP LOSS FIRST before Target on the same tick/candle update
+        if (checkHigh >= card.stopPrice) {
           // Stopped: Executable Ask price rose to or above stopPrice
           const fillPrice = +Math.max(card.stopPrice, execAsk).toFixed(this.precision);
           const grossPnl = ((card.entryPrice - fillPrice) / card.entryPrice) * 100;
@@ -2448,6 +3028,19 @@ export class OrderbookEngine {
           card.resolvedAt = now;
           card.durationSec = Math.max(1, durationSec);
           card.progressPct = -100;
+          card.grossPnlPct = +grossPnl.toFixed(2);
+          card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
+          resolved = true;
+        } else if (checkLow <= card.targetPrice) {
+          // Target reached: Executable Ask price fell to or below targetPrice without breaching stopPrice
+          const fillPrice = +Math.min(card.targetPrice, execAsk).toFixed(this.precision);
+          const grossPnl = ((card.entryPrice - fillPrice) / card.entryPrice) * 100;
+          card.status = 'HIT_TARGET';
+          card.exitPrice = fillPrice;
+          card.currentPrice = fillPrice;
+          card.resolvedAt = now;
+          card.durationSec = Math.max(1, durationSec);
+          card.progressPct = 100;
           card.grossPnlPct = +grossPnl.toFixed(2);
           card.pnlPct = +(grossPnl - totalCostPct).toFixed(2);
           resolved = true;
@@ -2495,28 +3088,265 @@ export class OrderbookEngine {
     }
   }
 
-  // Statistical Performance Analytics of generated scalping opportunities
-  public getOpportunityStats() {
+  // Statistical Performance & Equity Curve Analytics of generated scalping opportunities:
+  // 1. CANCELLED cards (e.g. symbol switched while card was active) are strictly excluded from all stats.
+  // 2. EXPIRED cards ARE included in resolvedCount and winRate denominator (never hidden).
+  // 3. Portfolio performance is modeled via a position-sized Equity Curve ($1,000 initial equity, 1% account risk = 1R per trade)
+  //    plus 1x compounded net return %, rather than a naive sum of unweighted percentages.
+  public getOpportunityStats(): OpportunityStats {
     const total = this.opportunities.length;
-    const resolved = this.opportunities.filter((o) => o.status !== 'ACTIVE');
+    const active = this.opportunities.filter((o) => o.status === 'ACTIVE');
     const hits = this.opportunities.filter((o) => o.status === 'HIT_TARGET');
     const stops = this.opportunities.filter((o) => o.status === 'STOPPED');
     const expired = this.opportunities.filter((o) => o.status === 'EXPIRED');
-    const active = this.opportunities.filter((o) => o.status === 'ACTIVE');
+    const cancelled = this.opportunities.filter((o) => o.status === 'CANCELLED');
 
-    // Decisive win rate (Target Hit vs Stopped); if only expired exist, count positive-PnL expired signals
-    const decisiveCount = hits.length + stops.length;
-    const expiredWins = expired.filter((o) => (o.pnlPct || 0) > 0).length;
-    const winRate =
-      decisiveCount > 0
-        ? +((hits.length / decisiveCount) * 100).toFixed(1)
-        : resolved.length > 0
-        ? +(((hits.length + expiredWins) / resolved.length) * 100).toFixed(1)
-        : 0;
+    // Only completed market outcomes (HIT_TARGET, STOPPED, EXPIRED) enter statistics; CANCELLED & ACTIVE are excluded
+    const resolved = this.opportunities.filter(
+      (o): o is OpportunityCard & { status: 'HIT_TARGET' | 'STOPPED' | 'EXPIRED' } =>
+        o.status === 'HIT_TARGET' || o.status === 'STOPPED' || o.status === 'EXPIRED'
+    );
+    const resolvedCount = resolved.length;
 
-    const resolvedPnL = resolved.reduce((acc, o) => acc + (o.pnlPct || 0), 0);
-    const activePnL = active.reduce((acc, o) => acc + (o.pnlPct || 0), 0);
-    const totalPnL = +(resolvedPnL + activePnL).toFixed(2);
+    // A trade is a net win ONLY if its Net PnL (after commission + half-spread) is strictly > 0
+    // EXPIRED trades are included in the denominator (resolvedCount); negative/flat EXPIRED trades count as losses
+    const winCount = resolved.filter((o) => (o.pnlPct ?? 0) > 0).length;
+    const lossCount = resolvedCount - winCount;
+
+    const winRate = resolvedCount > 0 ? +((winCount / resolvedCount) * 100).toFixed(1) : 0;
+    const targetHitRate = resolvedCount > 0 ? +((hits.length / resolvedCount) * 100).toFixed(1) : 0;
+
+    // Chronological Equity Curve & Risk-Sized Position Model ($1,000 starting capital, 1% equity risk = 1R per trade)
+    const initialEquity = 1000;
+    const riskPerTradeFrac = 0.01; // 1% of current equity risked per trade
+    let equity = initialEquity;
+    let peakEquity = initialEquity;
+    let maxDrawdownPct = 0;
+    let compounded1x = 1.0;
+    let totalR = 0;
+
+    const chronological = [...resolved].sort(
+      (a, b) => (a.resolvedAt || a.timestamp) - (b.resolvedAt || b.timestamp)
+    );
+
+    const equityCurve: EquityPoint[] = [];
+
+    for (const o of chronological) {
+      const feePct = o.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT;
+      const halfSpreadPct = ((o.spreadBps ?? 2.0) / 2) / 100;
+      const grossStopPct = o.riskPct && o.riskPct > 0
+        ? o.riskPct
+        : Math.max(0.25, (Math.abs(o.entryPrice - o.stopPrice) / Math.max(1e-9, o.entryPrice)) * 100);
+      // Total net loss % if Stop Loss is hit (stop distance + commission + half-spread)
+      const netStopPct = Math.max(0.15, grossStopPct + feePct + halfSpreadPct);
+      const netPnlPct = o.pnlPct ?? -(feePct + halfSpreadPct);
+
+      // Position Notional (USDT) sized so that a full netStopPct loss equals 1% of current equity (capped at 5x leverage)
+      const riskBudgetUsdt = equity * riskPerTradeFrac;
+      const positionUsdt = Math.min(equity * 5, riskBudgetUsdt / (netStopPct / 100));
+
+      const pnlUsdt = positionUsdt * (netPnlPct / 100);
+      const rMultiple = netPnlPct / netStopPct;
+
+      equity = Math.max(0, equity + pnlUsdt);
+      if (equity > peakEquity) peakEquity = equity;
+      if (peakEquity > 0) {
+        const dd = ((peakEquity - equity) / peakEquity) * 100;
+        if (dd > maxDrawdownPct) maxDrawdownPct = dd;
+      }
+
+      compounded1x *= Math.max(0, 1 + netPnlPct / 100);
+      totalR += rMultiple;
+
+      equityCurve.push({
+        ts: o.resolvedAt || o.timestamp,
+        equity: +equity.toFixed(2),
+        pnlUsdt: +pnlUsdt.toFixed(2),
+        rMultiple: +rMultiple.toFixed(2),
+        symbol: o.symbol,
+        status: o.status,
+      });
+    }
+
+    const currentEquity = +equity.toFixed(2);
+    const netProfitUsdt = +(currentEquity - initialEquity).toFixed(2);
+    const equityReturnPct = +(((currentEquity - initialEquity) / initialEquity) * 100).toFixed(2);
+    const compoundedPnLPct = +((compounded1x - 1) * 100).toFixed(2);
+    const roundedTotalR = +totalR.toFixed(2);
+    const expectancyR = resolvedCount > 0 ? +(totalR / resolvedCount).toFixed(2) : 0;
+
+    // Helper to compute realized R-multiple for any resolved card
+    const computeCardR = (o: OpportunityCard) => {
+      const feePct = o.feePct ?? OrderbookEngine.ROUND_TRIP_TAKER_FEE_PCT;
+      const halfSpreadPct = ((o.spreadBps ?? 2.0) / 2) / 100;
+      const grossStopPct =
+        o.riskPct && o.riskPct > 0
+          ? o.riskPct
+          : Math.max(0.25, (Math.abs(o.entryPrice - o.stopPrice) / Math.max(1e-9, o.entryPrice)) * 100);
+      const netStopPct = Math.max(0.15, grossStopPct + feePct + halfSpreadPct);
+      const netPnlPct = o.pnlPct ?? -(feePct + halfSpreadPct);
+      return netPnlPct / netStopPct;
+    };
+
+    // Empirical Confidence Bucket Breakdown: HIGH (≥78), MEDIUM (58-77), LOW (<58)
+    const buildBucket = (
+      tier: 'HIGH' | 'MEDIUM' | 'LOW',
+      label: string,
+      cards: (OpportunityCard & { status: 'HIT_TARGET' | 'STOPPED' | 'EXPIRED' })[]
+    ): ConfidenceBucketStats => {
+      const n = cards.length;
+      if (n === 0) {
+        return {
+          tier,
+          label,
+          resolvedCount: 0,
+          winCount: 0,
+          lossCount: 0,
+          hitCount: 0,
+          stopCount: 0,
+          expiredCount: 0,
+          winRate: 0,
+          targetHitRate: 0,
+          avgScore: 0,
+          avgNetPnlPct: 0,
+          expectancyR: 0,
+          totalR: 0,
+        };
+      }
+      const wCount = cards.filter((c) => (c.pnlPct ?? 0) > 0).length;
+      const hCount = cards.filter((c) => c.status === 'HIT_TARGET').length;
+      const sCount = cards.filter((c) => c.status === 'STOPPED').length;
+      const eCount = cards.filter((c) => c.status === 'EXPIRED').length;
+      const sumScore = cards.reduce((acc, c) => acc + (c.confidenceScore || 60), 0);
+      const sumPnl = cards.reduce((acc, c) => acc + (c.pnlPct ?? 0), 0);
+      const sumR = cards.reduce((acc, c) => acc + computeCardR(c), 0);
+
+      return {
+        tier,
+        label,
+        resolvedCount: n,
+        winCount: wCount,
+        lossCount: n - wCount,
+        hitCount: hCount,
+        stopCount: sCount,
+        expiredCount: eCount,
+        winRate: +((wCount / n) * 100).toFixed(1),
+        targetHitRate: +((hCount / n) * 100).toFixed(1),
+        avgScore: Math.round(sumScore / n),
+        avgNetPnlPct: +(sumPnl / n).toFixed(2),
+        expectancyR: +(sumR / n).toFixed(2),
+        totalR: +sumR.toFixed(2),
+      };
+    };
+
+    const highCards = resolved.filter((o) => (o.confidenceScore ?? 0) >= 78);
+    const medCards = resolved.filter((o) => (o.confidenceScore ?? 0) >= 58 && (o.confidenceScore ?? 0) < 78);
+    const lowCards = resolved.filter((o) => (o.confidenceScore ?? 0) < 58);
+
+    const confidenceBuckets = {
+      HIGH: buildBucket('HIGH', 'HIGH (≥78)', highCards),
+      MEDIUM: buildBucket('MEDIUM', 'MEDIUM (58–77)', medCards),
+      LOW: buildBucket('LOW', 'LOW (<58)', lowCards),
+    };
+
+    // Breakdown by Signal Type
+    const typeDefinitions: { type: OpportunityCard['type']; label: string }[] = [
+      { type: 'DEFENDED_WALL', label: '🛡️ Duvar Savunması' },
+      { type: 'VACUUM_SWEEP', label: '⚡ Sweep Kırılımı' },
+      { type: 'ICEBERG_ABSORPTION', label: '🧊 Iceberg Emilim' },
+      { type: 'DELTA_DIVERGENCE', label: '📊 Delta Uyumsuzluğu' },
+    ];
+
+    const typeBreakdown: SignalTypeStats[] = typeDefinitions.map(({ type, label }) => {
+      const cards = resolved.filter((o) => o.type === type);
+      const n = cards.length;
+      if (n === 0) {
+        return { type, label, resolvedCount: 0, winCount: 0, winRate: 0, expectancyR: 0, avgScore: 0 };
+      }
+      const wCount = cards.filter((c) => (c.pnlPct ?? 0) > 0).length;
+      const sumR = cards.reduce((acc, c) => acc + computeCardR(c), 0);
+      const sumScore = cards.reduce((acc, c) => acc + (c.confidenceScore || 60), 0);
+      return {
+        type,
+        label,
+        resolvedCount: n,
+        winCount: wCount,
+        winRate: +((wCount / n) * 100).toFixed(1),
+        expectancyR: +(sumR / n).toFixed(2),
+        avgScore: Math.round(sumScore / n),
+      };
+    });
+
+    // Brier Calibration Score & Monotonicity Verification (Does HIGH >= MEDIUM >= LOW hold empirically?)
+    let brierSum = 0;
+    for (const o of resolved) {
+      const prob = Math.min(0.95, Math.max(0.05, ((o.confidenceScore || 60) - 25) / 75));
+      const actual = (o.pnlPct ?? 0) > 0 ? 1 : 0;
+      brierSum += (prob - actual) * (prob - actual);
+    }
+    const brierScore = resolvedCount > 0 ? +(brierSum / resolvedCount).toFixed(3) : 0;
+
+    const highVsMedWinDelta = +(confidenceBuckets.HIGH.winRate - confidenceBuckets.MEDIUM.winRate).toFixed(1);
+    const highVsLowWinDelta = +(confidenceBuckets.HIGH.winRate - confidenceBuckets.LOW.winRate).toFixed(1);
+    const highVsMedRDelta = +(confidenceBuckets.HIGH.expectancyR - confidenceBuckets.MEDIUM.expectancyR).toFixed(2);
+
+    const calWeights = this.getCalibratedFactorWeights();
+    let calStatus: ConfidenceCalibration['status'] = 'INSUFFICIENT_DATA';
+    let calStatusText = 'Kalibrasyon ölçümü için kapanmış işlem verisi toplanıyor';
+
+    const hasHigh = confidenceBuckets.HIGH.resolvedCount > 0;
+    const hasMed = confidenceBuckets.MEDIUM.resolvedCount > 0;
+    const hasLow = confidenceBuckets.LOW.resolvedCount > 0;
+
+    if (resolvedCount >= 2 && (hasHigh || hasMed)) {
+      if (hasHigh && hasMed) {
+        const highBeatsMed =
+          confidenceBuckets.HIGH.winRate >= confidenceBuckets.MEDIUM.winRate &&
+          (!hasLow || confidenceBuckets.MEDIUM.winRate >= confidenceBuckets.LOW.winRate);
+        const highBeatsMedR = confidenceBuckets.HIGH.expectancyR >= confidenceBuckets.MEDIUM.expectancyR;
+
+        if (highBeatsMed) {
+          calStatus = 'MONOTONIC_VALID';
+          calStatusText = `Doğrulandı: HIGH (%${confidenceBuckets.HIGH.winRate}) ≥ MEDIUM (%${confidenceBuckets.MEDIUM.winRate})${
+            hasLow ? ` ≥ LOW (%${confidenceBuckets.LOW.winRate})` : ''
+          }`;
+        } else if (highBeatsMedR) {
+          calStatus = 'PARTIAL_VALID';
+          calStatusText = `R-Beklentisi Kalibre: HIGH (${confidenceBuckets.HIGH.expectancyR}R) ≥ MEDIUM (${confidenceBuckets.MEDIUM.expectancyR}R) · Kazanma farkı ${highVsMedWinDelta}%`;
+        } else {
+          calStatus = 'INVERTED_WARNING';
+          calStatusText = `Kalibrasyon Uyarısı: HIGH (%${confidenceBuckets.HIGH.winRate}) < MEDIUM (%${confidenceBuckets.MEDIUM.winRate}) — Bayesyen ağırlık düzeltmesi aktif`;
+        }
+      } else if (hasHigh && hasLow) {
+        if (confidenceBuckets.HIGH.winRate >= confidenceBuckets.LOW.winRate) {
+          calStatus = 'MONOTONIC_VALID';
+          calStatusText = `Doğrulandı: HIGH (%${confidenceBuckets.HIGH.winRate}) ≥ LOW (%${confidenceBuckets.LOW.winRate})`;
+        } else {
+          calStatus = 'INVERTED_WARNING';
+          calStatusText = `Kalibrasyon Uyarısı: HIGH (%${confidenceBuckets.HIGH.winRate}) < LOW (%${confidenceBuckets.LOW.winRate}) — Ağırlıklar sıkılaştırılıyor`;
+        }
+      } else {
+        calStatus = 'PARTIAL_VALID';
+        calStatusText = `${resolvedCount} kapanmış işlem kaydedildi — Kademeler arası karşılaştırma için örneklem birikiyor`;
+      }
+    }
+
+    const calibration: ConfidenceCalibration = {
+      status: calStatus,
+      statusText: calStatusText,
+      highVsMedWinDelta,
+      highVsLowWinDelta,
+      highVsMedRDelta,
+      brierScore,
+      sampleSize: resolvedCount,
+      weights: {
+        structure: calWeights.structure,
+        execution: calWeights.execution,
+        flow: calWeights.flow,
+        payoff: calWeights.payoff,
+        isEmpirical: calWeights.isEmpirical,
+      },
+    };
 
     return {
       total,
@@ -2524,9 +3354,25 @@ export class OrderbookEngine {
       hitCount: hits.length,
       stopCount: stops.length,
       expiredCount: expired.length,
-      resolvedCount: resolved.length,
+      cancelledCount: cancelled.length,
+      resolvedCount,
+      winCount,
+      lossCount,
       winRate,
-      totalPnL,
+      targetHitRate,
+      initialEquity,
+      currentEquity,
+      netProfitUsdt,
+      equityReturnPct,
+      compoundedPnLPct,
+      totalR: roundedTotalR,
+      expectancyR,
+      maxDrawdownPct: +maxDrawdownPct.toFixed(2),
+      equityCurve,
+      totalPnL: equityReturnPct,
+      confidenceBuckets,
+      typeBreakdown,
+      calibration,
     };
   }
 

@@ -48,6 +48,9 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const heatmapCanvasRef = useRef<HTMLCanvasElement>(null);
   const isDirtyRef = useRef(true);
+  const lastOverlayDrawTsRef = useRef(0);
+  const lastHeatmapDrawTsRef = useRef(0);
+  const lastSyncStateRef = useRef<boolean>(false);
 
   // Initialize TradingView Lightweight Chart
   useEffect(() => {
@@ -324,21 +327,42 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
     isDirtyRef.current = true;
   }, [candles, settings, symbol, precision, tickSize]);
 
-  // RequestAnimationFrame Loop for in-situ DOM Ladder and Wall Rays Drawing
+  // Throttled RequestAnimationFrame Loop (220ms for overlay, 250ms for heatmap; immediate on chart pan/zoom/resize)
   useEffect(() => {
     let animationFrameId: number;
+    isDirtyRef.current = true;
 
     const renderLoop = () => {
-      drawOrderbookOverlay();
-      if (settings.showHeatmap) {
-        drawLiquidityHeatmap();
-      } else {
+      const now = performance.now();
+      const currentSynced = engine.isOrderbookSynced();
+      if (currentSynced !== lastSyncStateRef.current) {
+        lastSyncStateRef.current = currentSynced;
+        isDirtyRef.current = true;
+      }
+      const dirty = isDirtyRef.current;
+
+      if (dirty || now - lastOverlayDrawTsRef.current >= 200) {
+        lastOverlayDrawTsRef.current = now;
+        drawOrderbookOverlay();
+      }
+
+      if (settings.showHeatmap && currentSynced) {
+        if (dirty || now - lastHeatmapDrawTsRef.current >= 250) {
+          lastHeatmapDrawTsRef.current = now;
+          drawLiquidityHeatmap();
+        }
+      } else if (dirty || !currentSynced) {
         const cv = heatmapCanvasRef.current;
         if (cv) {
           const ctx = cv.getContext('2d');
           if (ctx) ctx.clearRect(0, 0, cv.width, cv.height);
         }
       }
+
+      if (dirty) {
+        isDirtyRef.current = false;
+      }
+
       animationFrameId = requestAnimationFrame(renderLoop);
     };
 
@@ -361,11 +385,29 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
 
     ctx.clearRect(0, 0, w, h);
 
-    if (!engine.depthReady || !engine.bestBid || !engine.bestAsk) return;
-
-    const candleSeries = candleSeriesRef.current;
     const axisW = Math.max(0, Math.ceil(chartRef.current.priceScale('right').width() || 75));
     const chartRight = Math.max(0, w - axisW);
+
+    // Strictly refuse to render stale DOM ladder, stale wall rays, or stale MID price when orderbook is out of sync
+    if (!engine.isOrderbookSynced()) {
+      const msg = '⚠️ DEFTER SENKRONİZE DEĞİL · YENİDEN EŞİTLENİYOR';
+      ctx.font = 'bold 10.5px monospace';
+      const tw = ctx.measureText(msg).width;
+      const bx = Math.max(8, chartRight - tw - 20);
+      const by = 10;
+      ctx.fillStyle = 'rgba(22, 27, 34, 0.92)';
+      ctx.fillRect(bx, by, tw + 14, 22);
+      ctx.strokeStyle = 'rgba(239, 83, 80, 0.85)';
+      ctx.lineWidth = 1.2;
+      ctx.strokeRect(bx, by, tw + 14, 22);
+      ctx.fillStyle = '#ef5350';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(msg, bx + 7, by + 11);
+      return;
+    }
+
+    const candleSeries = candleSeriesRef.current;
 
     // 0. In-Situ Right-Axis DOM Depth Ladder Histogram Bars (when showLadder is enabled)
     if (settings.showLadder && (engine.bidsBook.size > 0 || engine.asksBook.size > 0)) {
@@ -374,7 +416,13 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
       if (rows > 0 && chartRight > 0) {
         const bidBins = new Float64Array(rows);
         const askBins = new Float64Array(rows);
+        const topP = candleSeries.coordinateToPrice(0);
+        const botP = candleSeries.coordinateToPrice(h);
+        const minVisP = topP !== null && botP !== null ? Math.min(topP, botP) : 0;
+        const maxVisP = topP !== null && botP !== null ? Math.max(topP, botP) : Infinity;
+
         const priceToRow = (p: number) => {
+          if (p < minVisP || p > maxVisP) return -1;
           const y = candleSeries.priceToCoordinate(p);
           if (y == null || y < 0 || y > h) return -1;
           return Math.min(rows - 1, Math.max(0, Math.floor(y / binPx)));
@@ -692,7 +740,7 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
 
     ctx.clearRect(0, 0, w, h);
 
-    if (!engine.depthReady || (!engine.bidsBook.size && !engine.asksBook.size)) return;
+    if (!engine.isOrderbookSynced() || (!engine.bidsBook.size && !engine.asksBook.size)) return;
 
     const candleSeries = candleSeriesRef.current;
     const axisW = Math.max(0, Math.ceil(chartRef.current.priceScale('right').width() || 75));
@@ -705,8 +753,13 @@ export const ChartWithOrderbook: React.FC<ChartWithOrderbookProps> = ({
 
     const bidBins = new Float64Array(rows);
     const askBins = new Float64Array(rows);
+    const topP = candleSeries.coordinateToPrice(0);
+    const botP = candleSeries.coordinateToPrice(h);
+    const minVisP = topP !== null && botP !== null ? Math.min(topP, botP) : 0;
+    const maxVisP = topP !== null && botP !== null ? Math.max(topP, botP) : Infinity;
 
     const priceToRow = (p: number) => {
+      if (p < minVisP || p > maxVisP) return -1;
       const y = candleSeries.priceToCoordinate(p);
       if (y == null || y < 0 || y > h) return -1;
       return Math.min(rows - 1, Math.max(0, Math.floor(y / binPx)));

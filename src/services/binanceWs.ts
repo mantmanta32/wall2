@@ -49,7 +49,11 @@ export class BinanceWsManager {
 
     // Attach snapshot resync request from engine if depth sequence breaks
     this.engine.onRequestSnapshot = () => {
+      this.notifyConnection();
       this.resyncSnapshot(false);
+    };
+    this.engine.onSyncStateChange = () => {
+      this.notifyConnection();
     };
   }
 
@@ -450,7 +454,9 @@ export class BinanceWsManager {
   private notifyConnection() {
     if (this.onConnectionChange) {
       this.onConnectionChange(
-        this.isKlineConnected && (this.isMarketConnected || (this.isDepthConnected && this.engine.depthSynced))
+        this.isKlineConnected &&
+          this.isDepthConnected &&
+          this.engine.isOrderbookSynced()
       );
     }
   }

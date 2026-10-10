@@ -7,6 +7,7 @@ interface HeaderProps {
   lastPrice: number;
   priceChangePercent: number;
   isConnected: boolean;
+  isDepthSynced?: boolean;
   isFavorite: boolean;
   onSelectSymbol: (symbol: string) => void;
   onToggleFavorite: () => void;
@@ -23,6 +24,7 @@ export const Header: React.FC<HeaderProps> = ({
   lastPrice,
   priceChangePercent,
   isConnected,
+  isDepthSynced = true,
   isFavorite,
   onSelectSymbol,
   onToggleFavorite,
@@ -52,9 +54,17 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex items-center gap-2">
           <span
             className={`w-2.5 h-2.5 rounded-full flex-none transition-colors duration-300 ${
-              isConnected ? 'bg-[#26a69a] shadow-[0_0_8px_#26a69a]' : 'bg-[#ef5350]'
+              isConnected && isDepthSynced
+                ? 'bg-[#26a69a] shadow-[0_0_8px_#26a69a]'
+                : !isDepthSynced
+                ? 'bg-[#e0b64c] animate-pulse shadow-[0_0_8px_#e0b64c]'
+                : 'bg-[#ef5350]'
             }`}
-            title={isConnected ? 'Binance WS Bağlı' : 'Bağlantı Bekleniyor'}
+            title={
+              isConnected && isDepthSynced
+                ? 'Binance WS & Emir Defteri Senkronize'
+                : 'Emir Defteri Senkronize Değil (Yeniden Eşitleniyor...)'
+            }
           />
 
           <div className="relative">
@@ -76,6 +86,15 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <Star className="w-4.5 h-4.5 fill-current" />
           </button>
+
+          {!isDepthSynced && (
+            <span
+              className="px-1.5 py-0.5 rounded bg-[#ef5350]/20 border border-[#ef5350]/60 text-[#ef5350] text-[10px] font-extrabold font-mono tracking-wide animate-pulse"
+              title="L2 Emir Defteri snapshot veya sıra numarası senkronize değil; bayat veri gizlendi ve yaşam döngüsü kontrolü duraklatıldı."
+            >
+              ⚠️ SENKRONİZE DEĞİL
+            </span>
+          )}
         </div>
 
         {/* Right: Quick Settings + Real-Time Price */}

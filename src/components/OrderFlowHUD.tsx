@@ -1,19 +1,9 @@
 import React, { useState } from 'react';
-import { OpportunityCard } from '../types/market';
-
-interface OpportunityStats {
-  total: number;
-  activeCount: number;
-  hitCount: number;
-  stopCount: number;
-  expiredCount: number;
-  resolvedCount: number;
-  winRate: number;
-  totalPnL: number;
-}
+import { OpportunityCard, OpportunityStats } from '../types/market';
 
 interface OrderFlowHUDProps {
   marketStatus: 'NOTR' | 'AL' | 'SAT' | 'SAVUNULDU' | 'SWEEP' | 'ICEBERG' | 'SPOOF' | 'DIVERGENCE';
+  isDepthSynced?: boolean;
   activeOpportunity?: OpportunityCard | null;
   opportunityStats?: OpportunityStats;
   allOpportunities?: OpportunityCard[];
@@ -24,6 +14,7 @@ interface OrderFlowHUDProps {
 
 export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
   marketStatus,
+  isDepthSynced = true,
   activeOpportunity,
   opportunityStats,
   allOpportunities = [],
@@ -64,6 +55,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
       case 'STOPPED':
         return 'bg-[#ef5350]/35 text-[#ef5350] border-[#ef5350] shadow-[0_0_16px_rgba(239,83,80,0.5)]';
       case 'EXPIRED':
+      case 'CANCELLED':
         return 'bg-[#6e7681]/30 text-[#8b949e] border-[#6e7681]/60';
       case 'ACTIVE':
       default:
@@ -83,6 +75,8 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
         return `🛑 STOPLANDI (${pnlStr})`;
       case 'EXPIRED':
         return `⏱️ SÜRE DOLDU (${pnlStr})`;
+      case 'CANCELLED':
+        return `🚫 İPTAL EDİLDİ (Sembol Değişti)`;
       case 'ACTIVE':
       default:
         if (opp.type === 'VACUUM_SWEEP') {
@@ -110,14 +104,23 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
   return (
     <div className="absolute top-2.5 left-2.5 z-30 flex flex-col gap-2 max-w-[calc(100vw-90px)] pointer-events-auto">
       <div className="flex items-center gap-2 flex-wrap">
-        {/* Market Microstructure Flow Badge */}
-        <span
-          className={`px-3 py-1 rounded-full text-[11px] font-black tracking-wider uppercase border backdrop-blur-md transition-all ${
-            statusColors[marketStatus] || statusColors.NOTR
-          }`}
-        >
-          {statusLabels[marketStatus] || marketStatus}
-        </span>
+        {/* Market Microstructure Flow Badge or Unsynchronized Warning */}
+        {!isDepthSynced ? (
+          <span
+            className="px-3 py-1 rounded-full text-[11px] font-black tracking-wider uppercase border backdrop-blur-md bg-[#ef5350]/25 text-[#ef5350] border-[#ef5350] shadow-[0_0_12px_rgba(239,83,80,0.45)] animate-pulse"
+            title="Emir defteri snapshot veya WebSocket akışı senkronize değil. Bayat defter gizlendi, yaşam döngüsü kontrolleri senkronizasyon tamamlanana kadar duraklatıldı."
+          >
+            ⚠️ DEFTER SENKRONİZE DEĞİL (EŞİTLENİYOR...)
+          </span>
+        ) : (
+          <span
+            className={`px-3 py-1 rounded-full text-[11px] font-black tracking-wider uppercase border backdrop-blur-md transition-all ${
+              statusColors[marketStatus] || statusColors.NOTR
+            }`}
+          >
+            {statusLabels[marketStatus] || marketStatus}
+          </span>
+        )}
 
         {/* Scalp Opportunity Live Pill */}
         {activeOpportunity && (
@@ -162,14 +165,14 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
           </div>
         )}
 
-        {/* Scalp Performance Win-Rate Badge (Always visible & clickable to view history) */}
+        {/* Scalp Performance Win-Rate & Equity Badge (Always visible & clickable to view history) */}
         {opportunityStats && (
           <button
             onClick={() => setShowHistoryModal(true)}
-            title="Tüm fırsat geçmişini ve başarı analitiğini gör"
+            title="Gerçek Net Başarı Oranı (EXPIRED dahil) ve $1,000 Kasa Eğrisi Analitiği"
             className="px-2.5 py-1 rounded-full text-[10px] font-mono font-bold bg-[#161b22]/90 border border-[#30363d] hover:border-[#4c8ce0]/60 backdrop-blur-md flex items-center gap-1.5 transition-all shadow-sm cursor-pointer"
           >
-            <span className="text-[#8b949e]">BAŞARI:</span>
+            <span className="text-[#8b949e]">NET BAŞARI:</span>
             <span
               className={
                 opportunityStats.winRate >= 50
@@ -182,20 +185,22 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
               %{opportunityStats.winRate}
             </span>
             <span className="text-[#8b949e] opacity-80">
-              ({opportunityStats.hitCount}W/{opportunityStats.stopCount}L
-              {opportunityStats.activeCount > 0 ? ` · ${opportunityStats.activeCount} aktif` : ''})
+              ({opportunityStats.winCount}W/{opportunityStats.lossCount}L
+              {opportunityStats.expiredCount > 0 ? ` · ${opportunityStats.expiredCount}E` : ''}
+              {opportunityStats.activeCount > 0 ? ` · ${opportunityStats.activeCount}A` : ''})
             </span>
             <span
               className={`font-semibold ${
-                opportunityStats.totalPnL > 0
+                opportunityStats.equityReturnPct > 0
                   ? 'text-[#26a69a]'
-                  : opportunityStats.totalPnL < 0
+                  : opportunityStats.equityReturnPct < 0
                   ? 'text-[#ef5350]'
                   : 'text-[#8b949e]'
               }`}
             >
-              {opportunityStats.totalPnL >= 0 ? '+' : ''}
-              {opportunityStats.totalPnL}%
+              ${opportunityStats.currentEquity.toFixed(0)} ({opportunityStats.equityReturnPct >= 0 ? '+' : ''}
+              {opportunityStats.equityReturnPct}% · {opportunityStats.totalR >= 0 ? '+' : ''}
+              {opportunityStats.totalR}R)
             </span>
             <span className="text-[9px] text-[#4c8ce0] ml-0.5">📊</span>
           </button>
@@ -213,7 +218,7 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                     ? 'bg-[#26a69a]/20 text-[#26a69a] border border-[#26a69a]/40'
                     : activeOpportunity.status === 'STOPPED'
                     ? 'bg-[#ef5350]/20 text-[#ef5350] border border-[#ef5350]/40'
-                    : activeOpportunity.status === 'EXPIRED'
+                    : activeOpportunity.status === 'EXPIRED' || activeOpportunity.status === 'CANCELLED'
                     ? 'bg-[#6e7681]/20 text-[#8b949e] border border-[#6e7681]/40'
                     : 'bg-[#4c8ce0]/20 text-[#4c8ce0] border border-[#4c8ce0]/40'
                 }`}
@@ -224,6 +229,8 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                   ? 'STOP'
                   : activeOpportunity.status === 'EXPIRED'
                   ? 'SÜRE DOLDU'
+                  : activeOpportunity.status === 'CANCELLED'
+                  ? 'İPTAL (SEMBOL)'
                   : 'AKTİF'}
               </span>
               <span className="font-bold text-[#e6e8ea] truncate text-[11px]">
@@ -355,46 +362,134 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
 
             {/* Performance Stats Overview */}
             {opportunityStats && (
-              <div className="grid grid-cols-4 gap-2 p-3 bg-[#161b22] border-b border-[#21262d] text-center">
-                <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
-                  <div className="text-[9px] text-[#8b949e]">BAŞARI ORANI</div>
-                  <div
-                    className={`font-bold text-sm ${
-                      opportunityStats.winRate >= 50
-                        ? 'text-[#26a69a]'
-                        : opportunityStats.resolvedCount > 0
-                        ? 'text-[#ef5350]'
-                        : 'text-[#e6e8ea]'
-                    }`}
-                  >
-                    %{opportunityStats.winRate}
+              <div className="bg-[#161b22] border-b border-[#21262d] p-3 space-y-2.5">
+                <div className="grid grid-cols-4 gap-2 text-center">
+                  <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
+                    <div className="text-[8px] text-[#8b949e]">NET BAŞARI (EXPIRED DAHİL)</div>
+                    <div
+                      className={`font-bold text-sm ${
+                        opportunityStats.winRate >= 50
+                          ? 'text-[#26a69a]'
+                          : opportunityStats.resolvedCount > 0
+                          ? 'text-[#ef5350]'
+                          : 'text-[#e6e8ea]'
+                      }`}
+                    >
+                      %{opportunityStats.winRate}
+                    </div>
+                    <div className="text-[8px] text-[#8b949e] mt-0.5">
+                      {opportunityStats.winCount}W / {opportunityStats.lossCount}L (Hedef %{opportunityStats.targetHitRate})
+                    </div>
+                  </div>
+                  <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
+                    <div className="text-[8px] text-[#8b949e]">SONUÇ DAĞILIMI</div>
+                    <div className="font-bold text-xs text-[#e6e8ea] mt-0.5">
+                      <span className="text-[#26a69a]">{opportunityStats.hitCount}H</span> /{' '}
+                      <span className="text-[#ef5350]">{opportunityStats.stopCount}S</span> /{' '}
+                      <span className="text-[#e0b64c]">{opportunityStats.expiredCount}E</span>
+                    </div>
+                    <div className="text-[8px] text-[#8b949e] mt-0.5">
+                      {opportunityStats.cancelledCount} İptal (Hariç) · {opportunityStats.activeCount} Aktif
+                    </div>
+                  </div>
+                  <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
+                    <div className="text-[8px] text-[#8b949e]">TOPLAM R & BEKLENTİ</div>
+                    <div
+                      className={`font-bold text-sm ${
+                        opportunityStats.totalR >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
+                      }`}
+                    >
+                      {opportunityStats.totalR >= 0 ? '+' : ''}
+                      {opportunityStats.totalR}R
+                    </div>
+                    <div className="text-[8px] text-[#8b949e] mt-0.5">
+                      Ort: {opportunityStats.expectancyR >= 0 ? '+' : ''}
+                      {opportunityStats.expectancyR}R · DD: -%{opportunityStats.maxDrawdownPct}
+                    </div>
+                  </div>
+                  <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
+                    <div className="text-[8px] text-[#8b949e]">KASA ($1,000 · 1R=%1 RİSK)</div>
+                    <div
+                      className={`font-bold text-sm ${
+                        opportunityStats.netProfitUsdt >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
+                      }`}
+                    >
+                      ${opportunityStats.currentEquity.toFixed(2)}
+                    </div>
+                    <div className="text-[8px] text-[#8b949e] mt-0.5">
+                      {opportunityStats.equityReturnPct >= 0 ? '+' : ''}
+                      {opportunityStats.equityReturnPct}% (1x Bileşik: {opportunityStats.compoundedPnLPct >= 0 ? '+' : ''}
+                      {opportunityStats.compoundedPnLPct}%)
+                    </div>
                   </div>
                 </div>
-                <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
-                  <div className="text-[9px] text-[#8b949e]">HEDEF / STOP</div>
-                  <div className="font-bold text-sm text-[#e6e8ea]">
-                    <span className="text-[#26a69a]">{opportunityStats.hitCount}W</span> /{' '}
-                    <span className="text-[#ef5350]">{opportunityStats.stopCount}L</span>
-                  </div>
-                </div>
-                <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
-                  <div className="text-[9px] text-[#8b949e]">SÜRE / AKTİF</div>
-                  <div className="font-bold text-sm text-[#8b949e]">
-                    {opportunityStats.expiredCount}E /{' '}
-                    <span className="text-[#4c8ce0]">{opportunityStats.activeCount}A</span>
-                  </div>
-                </div>
-                <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
-                  <div className="text-[9px] text-[#8b949e]">TOPLAM NET PnL</div>
-                  <div
-                    className={`font-bold text-sm ${
-                      opportunityStats.totalPnL >= 0 ? 'text-[#26a69a]' : 'text-[#ef5350]'
-                    }`}
-                  >
-                    {opportunityStats.totalPnL >= 0 ? '+' : ''}
-                    {opportunityStats.totalPnL}%
-                  </div>
-                </div>
+
+                {/* Position-Sized Equity Curve SVG ($1,000 Base, 1% Equity Risk per Trade) */}
+                {opportunityStats.equityCurve.length > 0 && (() => {
+                  const pts = [
+                    { equity: opportunityStats.initialEquity, rMultiple: 0, status: 'EXPIRED' as const },
+                    ...opportunityStats.equityCurve,
+                  ];
+                  const equities = pts.map((p) => p.equity);
+                  const minEq = Math.min(...equities, opportunityStats.initialEquity * 0.98);
+                  const maxEq = Math.max(...equities, opportunityStats.initialEquity * 1.02);
+                  const span = Math.max(1, maxEq - minEq);
+                  const w = 440;
+                  const h = 54;
+                  const toX = (i: number) =>
+                    pts.length <= 1 ? w / 2 : Math.round((i / (pts.length - 1)) * (w - 16) + 8);
+                  const toY = (eq: number) =>
+                    Math.round(h - 6 - ((eq - minEq) / span) * (h - 12));
+                  const baseY = toY(opportunityStats.initialEquity);
+                  const pathD = pts
+                    .map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${toX(idx)} ${toY(p.equity)}`)
+                    .join(' ');
+                  const isUp = opportunityStats.currentEquity >= opportunityStats.initialEquity;
+                  return (
+                    <div className="bg-[#0d1117] p-2 rounded border border-[#21262d]">
+                      <div className="flex items-center justify-between text-[9px] text-[#8b949e] mb-1">
+                        <span>📈 KASA EĞRİSİ (Pozisyon Büyüklüğü = Stop Mesafesine Göre %1 Kasa Riski / Komisyon & ½Spread Dahil)</span>
+                        <span className={isUp ? 'text-[#26a69a] font-bold' : 'text-[#ef5350] font-bold'}>
+                          {opportunityStats.netProfitUsdt >= 0 ? '+' : ''}${opportunityStats.netProfitUsdt.toFixed(2)}
+                        </span>
+                      </div>
+                      <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-14 overflow-visible">
+                        <line
+                          x1={0}
+                          y1={baseY}
+                          x2={w}
+                          y2={baseY}
+                          stroke="#30363d"
+                          strokeDasharray="3 3"
+                          strokeWidth={1}
+                        />
+                        <path
+                          d={pathD}
+                          fill="none"
+                          stroke={isUp ? '#26a69a' : '#ef5350'}
+                          strokeWidth={2}
+                        />
+                        {pts.map((p, idx) =>
+                          idx === 0 ? null : (
+                            <circle
+                              key={idx}
+                              cx={toX(idx)}
+                              cy={toY(p.equity)}
+                              r={2.5}
+                              fill={
+                                p.status === 'HIT_TARGET'
+                                  ? '#26a69a'
+                                  : p.status === 'STOPPED'
+                                  ? '#ef5350'
+                                  : '#e0b64c'
+                              }
+                            />
+                          )
+                        )}
+                      </svg>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
@@ -423,7 +518,9 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                           : opp.status === 'STOPPED'
                           ? 'bg-[#ef5350]/10 border-[#ef5350]/40'
                           : opp.status === 'EXPIRED'
-                          ? 'bg-[#6e7681]/10 border-[#6e7681]/30'
+                          ? 'bg-[#e0b64c]/10 border-[#e0b64c]/30'
+                          : opp.status === 'CANCELLED'
+                          ? 'bg-[#6e7681]/10 border-[#6e7681]/25 opacity-65'
                           : 'bg-[#0d1117] border-[#4c8ce0]/40'
                       }`}
                     >
@@ -452,17 +549,21 @@ export const OrderFlowHUD: React.FC<OrderFlowHUDProps> = ({
                               : opp.status === 'STOPPED'
                               ? 'bg-[#ef5350]/25 text-[#ef5350] border-[#ef5350]/60'
                               : opp.status === 'EXPIRED'
-                              ? 'bg-[#6e7681]/25 text-[#8b949e] border-[#6e7681]/50'
+                              ? 'bg-[#e0b64c]/25 text-[#e0b64c] border-[#e0b64c]/50'
+                              : opp.status === 'CANCELLED'
+                              ? 'bg-[#6e7681]/20 text-[#8b949e] border-[#6e7681]/40'
                               : 'bg-[#4c8ce0]/25 text-[#4c8ce0] border-[#4c8ce0]/50 animate-pulse'
                           }`}
                         >
                           {opp.status === 'HIT_TARGET'
-                            ? `✅ Net (${pnl >= 0 ? '+' : ''}${pnl}%)`
+                            ? `✅ Hedef (${pnl >= 0 ? '+' : ''}${pnl}%)`
                             : opp.status === 'STOPPED'
-                            ? `🛑 Net (${pnl}%)`
+                            ? `🛑 Stop (${pnl}%)`
                             : opp.status === 'EXPIRED'
-                            ? `⏱️ Net (${pnl >= 0 ? '+' : ''}${pnl}%)`
-                            : `🎯 Net (${pnl >= 0 ? '+' : ''}${pnl}% · ${rem}s)`}
+                            ? `⏱️ Süre Doldu (${pnl >= 0 ? '+' : ''}${pnl}%)`
+                            : opp.status === 'CANCELLED'
+                            ? `🚫 İptal (Sembol Değişti · İstatistik Dışı)`
+                            : `🎯 Aktif (${pnl >= 0 ? '+' : ''}${pnl}% · ${rem}s)`}
                         </span>
                       </div>
 
