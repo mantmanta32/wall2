@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile document containing favorites, custom settings and timestamps",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth User UID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name",
+          "maxLength": 100
+        },
+        "favorites": {
+          "type": "array",
+          "description": "List of favorite crypto symbols (e.g. ALLOUSDT, BTCUSDT)"
+        },
+        "settings": {
+          "type": "object",
+          "description": "User orderbook terminal settings"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of profile creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of profile update"
+        }
+      },
+      "required": ["uid"]
+    },
+    "FavoriteCoin": {
+      "title": "FavoriteCoin",
+      "description": "A single favorite cryptocurrency symbol tracked by user",
+      "type": "object",
+      "properties": {
+        "symbol": {
+          "type": "string",
+          "description": "Cryptocurrency pair symbol",
+          "maxLength": 30
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when added"
+        }
+      },
+      "required": ["symbol"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile with synchronized settings and watchlist"
+    },
+    "/users/{userId}/favorites/{symbol}": {
+      "schema": "FavoriteCoin",
+      "description": "User's favorite trading symbols"
+    }
+  }
+}

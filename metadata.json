@@ -1,0 +1,8 @@
+{
+  "name": "Orderbook Wall & Flow Scalper",
+  "description": "Canlı L2 derinlik, kurumsal duvar savunma tespiti, mesafe ağırlıklı OBI ve iceberg emilim analiz terminali.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
